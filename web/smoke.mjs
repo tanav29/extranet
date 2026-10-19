@@ -1,9 +1,10 @@
 import { Window } from "happy-dom";
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { pathToFileURL } from "node:url";
 
-const base = process.cwd(); // web/
+const base = path.dirname(fileURLToPath(import.meta.url)); // web/
 const pub = path.resolve(base, "..", "public", "app", "assets");
 
 function entryChunk(prefix) {

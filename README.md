@@ -4,7 +4,12 @@ Share folders from your computer with the people around you — over your Wi-Fi,
 or with anyone anywhere through a Cloudflare link.
 
 Guests get a dead-simple page: browse folders, view photos / PDFs / video / text
-right in the browser, and download anything (or a whole folder as one `.zip`).
+right in the browser, and download anything (or a whole folder as a single
+`.zip`).
+
+The backend is a **Fastify** Node.js server (`server.js`), and the frontend is a
+plain **React** app (`web/`, Vite + Tailwind) that compiles into `public/app/`
+and is served statically — no server-side templating.
 
 ```
 npm start
@@ -56,6 +61,11 @@ The server serves the prebuilt bundle in `public/app/`. To change the design:
 npm run setup:web   # once — installs React/Vite/Tailwind/shadcn deps
 npm run build:web   # rebuilds public/app from web/src
 ```
+
+For live-reload UI work: `npm run setup:web`, run `npm start` in the repo root
+(the Fastify server), then `npm run dev` inside `web/` and open the Vite URL —
+API calls are proxied to the Fastify server automatically. To check that all
+three pages still boot against a running server: `npm run smoke`.
 
 ## Ports
 

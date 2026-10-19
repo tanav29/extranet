@@ -2,17 +2,18 @@
 /*
  * Extranet — share folders from this computer.
  *
+ *  - Fastify Node.js server (two instances: HTTP + self-signed HTTPS)
  *  - Serves each configured folder ("share") under a URL path, e.g. /photos
- *  - Guests get a dead-simple page: browse, view images/PDFs/video/text, download
+ *  - The React app in web/ compiles into public/app and is served statically:
+ *    admin console (/admin), guest browser (any share path), analytics (/analytics)
  *  - LAN over HTTPS (self-signed) and HTTP, plus a Cloudflare quick-tunnel for internet access
  *  - Admin console at /admin (this machine only, or with a token)
  *
- * Only two small dependencies (qrcode, selfsigned); everything else is Node core.
+ * Small dependencies: fastify, qrcode, selfsigned.
  */
 'use strict';
 
-const http = require('http');
-const https = require('https');
+const https = require('https'); // used only for the cloudflared download
 const fs = require('fs');
 const fsp = fs.promises;
 const path = require('path');
@@ -20,6 +21,7 @@ const os = require('os');
 const crypto = require('crypto');
 const zlib = require('zlib');
 const { spawn, spawnSync } = require('child_process');
+const Fastify = require('fastify');
 
 const ROOT = __dirname;
 const PUBLIC_DIR = path.join(ROOT, 'public');
@@ -28,6 +30,8 @@ const CERT_FILE = path.join(DATA_DIR, 'certs', 'cert.pem');
 const KEY_FILE = path.join(DATA_DIR, 'certs', 'key.pem');
 const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
 const BIN_DIR = path.join(ROOT, 'bin');
+
+const TUNNEL_HOST_RE = /\.trycloudflare\.com$/i;
 
 let QRCode = null;
 try { QRCode = require('qrcode'); } catch { /* optional: served without QR */ }
@@ -103,44 +107,29 @@ function isLocalSocket(sock) {
   return a === '127.0.0.1' || a === '::1' || a === '::ffff:127.0.0.1';
 }
 
-function sendJSON(res, status, obj) {
-  const body = JSON.stringify(obj);
-  res.writeHead(status, {
-    'Content-Type': 'application/json; charset=utf-8',
-    'Cache-Control': 'no-store',
-  });
-  res.end(body);
+function json(reply, status, obj) {
+  return reply.code(status).header('Cache-Control', 'no-store').send(obj);
 }
 
-function sendHTML(res, status, title, bodyHtml) {
-  res.writeHead(status, {
-    'Content-Type': 'text/html; charset=utf-8',
-    'Cache-Control': 'no-store',
-    'X-Robots-Tag': 'noindex',
-  });
-  res.end(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+function html(reply, status, title, bodyHtml) {
+  return reply.code(status)
+    .header('Content-Type', 'text/html; charset=utf-8')
+    .header('Cache-Control', 'no-store')
+    .header('X-Robots-Tag', 'noindex')
+    .send(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${escapeHTML(title)}</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔗</text></svg>">
 <style>body{font:16px/1.6 system-ui,sans-serif;color:#1c1e21;display:grid;place-items:center;min-height:100vh;margin:0}main{max-width:34em;padding:2rem;text-align:center}h1{font-size:1.3rem;font-weight:600}p{color:#6b7280}</style>
 <main>${bodyHtml}</main>`);
 }
 
-function escapeHTML(s) {
-  return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+function pageHTML(title, bodyHtml) {
+  return `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${escapeHTML(title)}</title><style>body{font:16px/1.6 system-ui,sans-serif;color:#1c1e21;display:grid;place-items:center;min-height:100vh;margin:0}main{max-width:34em;padding:2rem;text-align:center}h1{font-size:1.3rem;font-weight:600}p{color:#6b7280}</style><main>${bodyHtml}</main>`;
 }
 
-function readBody(req, limit = 2000000) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    let n = 0;
-    req.on('data', (c) => {
-      n += c.length;
-      if (n > limit) { reject(new Error('body too large')); req.destroy(); return; }
-      chunks.push(c);
-    });
-    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
-    req.on('error', reject);
-  });
+function escapeHTML(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
 function timingSafeToken(got, want) {
@@ -607,6 +596,7 @@ function startTunnel() {
       else tunnel.error = null;
     });
     // quick tunnels usually announce their URL within ~3s
+    let startedAt = Date.now();
     const check = setInterval(() => {
       if (tunnel.proc !== proc) { clearInterval(check); }
       if (tunnel.status === 'running' || tunnel.proc !== proc) {
@@ -617,7 +607,6 @@ function startTunnel() {
         resolve({ ok: false, url: null, status: tunnel.status, error: tunnel.error || 'no URL yet — it may still come up, or the network may block it' });
       }
     }, 400);
-    const startedAt = Date.now();
   });
 }
 
@@ -629,77 +618,192 @@ function stopTunnel() {
 }
 
 /* ------------------------------------------------------------------ */
-/* Servers (HTTP + HTTPS)                                              */
+/* The Fastify app                                                     */
 /* ------------------------------------------------------------------ */
 
-const servers = {
-  http: null,
-  https: null,
-  httpPort: config.httpPort,
-  httpsPort: config.httpsPort,
-  httpsError: null,
+/* Built frontend (web/ → npm run build → public/app) */
+const APP_TYPES = {
+  '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml',
+  '.woff2': 'font/woff2', '.woff': 'font/woff',
+  '.map': 'application/json', '.txt': 'text/plain; charset=utf-8',
+  '.html': 'text/html; charset=utf-8',
 };
 
-function listenOnce(server, port) {
-  return new Promise((resolve, reject) => {
-    const onError = (err) => { server.removeAllListeners('listening'); reject(err); };
-    server.once('error', onError);
-    server.listen(port, '0.0.0.0', () => resolve());
-  });
-}
-
-async function listenWithBump(create, basePort, tries = 20) {
-  for (let i = 0; i < tries; i++) {
-    const port = basePort + i;
-    const server = create();
-    try {
-      await listenOnce(server, port);
-      return { server, port };
-    } catch (err) {
-      if (err.code !== 'EADDRINUSE') throw err;
-    }
+function appPage(name) {
+  try { return fs.readFileSync(path.join(PUBLIC_DIR, 'app', name)); }
+  catch {
+    return Buffer.from(pageHTML('UI not built', `<h1>UI not built</h1>
+<p>The interface is missing. Run <code>npm run build</code> inside the <code>web/</code> folder once, then restart.</p>`));
   }
-  throw new Error(`no free port found from ${basePort}`);
 }
 
-async function closeServer(server) {
-  if (!server) return;
-  await new Promise((r) => {
-    server.close(() => r());
-    setTimeout(() => { try { server.closeAllConnections && server.closeAllConnections(); } catch {} r(); }, 1500);
+function sendPage(reply, name) {
+  return reply.code(200)
+    .header('Content-Type', 'text/html; charset=utf-8')
+    .header('Cache-Control', 'no-store')
+    .header('X-Robots-Tag', 'noindex')
+    .send(appPage(name));
+}
+
+function notFoundPage(reply, message) {
+  return html(reply, 404, 'Nothing here', `<h1>Nothing here</h1><p>${escapeHTML(message)}</p>`);
+}
+
+function blockedPage(reply, ip) {
+  return html(reply, 403, 'Blocked', `<h1>Blocked</h1>
+<p>The owner of this server has blocked this address.</p>
+<p class="mono" style="font:12px monospace">${escapeHTML(ip || '')}</p>`);
+}
+
+/*
+ * Build one protocol's app. Called once for HTTP and (independently) for HTTPS,
+ * so settings changes can close and rebuild instances.
+ */
+function buildApp(httpsCreds) {
+  const app = Fastify({
+    ...(httpsCreds ? { https: httpsCreds } : {}),
+    logger: false,
+    bodyLimit: 2 * 1024 * 1024, // same cap as the previous readBody()
   });
+
+  /*
+   * Parse every request body as plain text; the admin endpoints JSON.parse it
+   * themselves (like the old readBody() did), so bad JSON keeps producing the
+   * same friendly "bad json" errors instead of Fastify's stricter ones.
+   */
+  const rawBodyParser = (_req, body, done) => done(null, body == null ? '' : String(body));
+  app.addContentTypeParser('application/json', { parseAs: 'string' }, rawBodyParser);
+  app.addContentTypeParser('*', { parseAs: 'string' }, rawBodyParser);
+  app.decorateRequest('ctx', null);
+  app.decorateRequest('__ev', null);
+
+  app.addHook('onRequest', onRequestSetup);
+
+  app.get('/favicon.ico', faviconRoute);
+  app.get('/robots.txt', robotsRoute);
+  app.get('/fonts.css', fontsRoute);
+  app.get('/fonts/*', fontsRoute);
+  app.all('/app', appAssetRoute);   // non-GET methods must still 405, like before
+  app.all('/app/*', appAssetRoute);
+  app.all('/admin', adminRoute);
+  app.all('/admin/*', adminRoute);
+  app.all('/analytics', analyticsRoute);
+  app.get('/', rootRoute);
+
+  // Everything else is a share
+  app.setNotFoundHandler((req, reply) => serveShare(req, reply));
+
+  return app;
 }
 
-async function startServers() {
-  await closeServer(servers.http);
-  await closeServer(servers.https);
-  servers.httpsError = null;
+/* --- per-request setup: analytics event, byte tap, blocklist --- */
 
-  const needSave = { http: config.httpPort !== servers.httpPort, https: config.httpsPort !== servers.httpsPort };
-  const httpRes = await listenWithBump(() => http.createServer(handle), config.httpPort);
-  servers.http = httpRes.server;
-  servers.httpPort = httpRes.port;
-  if (config.httpPort !== httpRes.port) { config.httpPort = httpRes.port; needSave.http = true; }
+async function onRequestSetup(req, reply) {
+  const raw = req.raw;
+  const rawUrl = raw.url || '/';
 
-  if (config.httpsEnabled) {
-    try {
-      const creds = ensureCertificate();
-      const httpsRes = await listenWithBump(() => https.createServer(creds, handle), config.httpsPort);
-      servers.https = httpsRes.server;
-      servers.httpsPort = httpsRes.port;
-      if (config.httpsPort !== httpsRes.port) { config.httpsPort = httpsRes.port; needSave.https = true; }
-    } catch (err) {
-      servers.https = null;
-      servers.httpsError = err.message;
-    }
-  } else {
-    servers.https = null;
+  if (rawUrl.startsWith('//')) return json(reply, 400, { error: 'bad url' });
+
+  const local = isLocalSocket(raw.socket);
+  const isTunnel = TUNNEL_HOST_RE.test(String(raw.headers.host || '').toLowerCase());
+  const ip = requestIP(raw, isTunnel);
+  const kind = isTunnel ? 'tunnel' : local ? 'local' : 'lan';
+  req.ctx = { isTunnel, local, ip, kind };
+
+  // bodies without a content-type are interpreted as JSON (as before)
+  const method = raw.method || 'GET';
+  if (method !== 'GET' && method !== 'HEAD' && !raw.headers['content-type'] && raw.headers['content-length']) {
+    raw.headers['content-type'] = 'application/json';
   }
-  saveConfig();
+
+  // access log entry — filled in when the response finishes
+  tapResponse(reply.raw);
+  const ev = {
+    t: Date.now(), ip, method, path: rawUrl,
+    status: 0, bytes: 0, ua: String(raw.headers['user-agent'] || '').slice(0, 160),
+    share: null, kind, blocked: false,
+  };
+  req.__ev = ev;
+  reply.raw.on('finish', () => {
+    ev.status = reply.raw.statusCode;
+    ev.bytes = reply.raw.__bytes || 0;
+    if (!ev.share) {
+      let pathname = ev.path.split('?')[0];
+      try { pathname = new URL(ev.path, 'http://internal').pathname; } catch { /* keep raw */ }
+      const m = findMount(pathname, isTunnel);
+      ev.share = m ? m.path : null;
+    }
+    try { maybeRecord(ev, local); } catch { /* never break a response over logging */ }
+  });
+
+  // blocked clients: guests get rejected before anything is served
+  if (!local && isBlocked(ip)) {
+    ev.blocked = true;
+    return blockedPage(reply, ip);
+  }
+}
+
+/* --- small global routes --- */
+
+async function faviconRoute(_req, reply) {
+  return reply.code(204).send();
+}
+
+async function robotsRoute(_req, reply) {
+  return reply.code(200).type('text/plain').send('User-agent: *\nDisallow: /\n');
+}
+
+async function fontsRoute(req, reply) {
+  const { pathname } = new URL(req.raw.url || '/fonts.css', 'http://internal');
+  const rel = pathname.slice(1).replace(/\.\./g, '');
+  const fp = path.join(PUBLIC_DIR, rel);
+  if (!fp.startsWith(PUBLIC_DIR)) return reply.code(403).send();
+  let data = null;
+  try { data = fs.readFileSync(fp); } catch { /* fall through */ }
+  if (!data) return reply.code(404).send();
+  const type = fp.endsWith('.css') ? 'text/css; charset=utf-8' : fp.endsWith('.woff2') ? 'font/woff2' : 'application/octet-stream';
+  return reply.code(200).type(type).header('Cache-Control', 'public, max-age=86400').send(data);
+}
+
+async function appAssetRoute(req, reply) {
+  const { pathname } = new URL(req.raw.url || '/app', 'http://internal');
+  if (req.raw.method !== 'GET' && req.raw.method !== 'HEAD') return reply.code(405).send();
+  let rel;
+  try { rel = decodeURIComponent(pathname.slice('/app/'.length)).replace(/\.\.+/g, ''); } catch { return reply.code(400).send(); }
+  const base = path.join(PUBLIC_DIR, 'app');
+  const fp = path.resolve(base, rel);
+  if (!fp.startsWith(base + path.sep)) return reply.code(403).send();
+  let data;
+  try { data = fs.readFileSync(fp); } catch { return reply.code(404).send(); }
+  const type = APP_TYPES[path.extname(fp).toLowerCase()];
+  if (!type) return reply.code(404).send(); // stay tight: only known asset types
+  const immutable = pathname.startsWith('/app/assets/');
+  return reply.code(200)
+    .type(type)
+    .header('Cache-Control', immutable ? 'public, max-age=31536000, immutable' : 'no-cache')
+    .header('X-Robots-Tag', 'noindex')
+    .send(data);
+}
+
+async function analyticsRoute(req, reply) {
+  const ctx = req.ctx;
+  if (ctx.isTunnel) {
+    return html(reply, 403, 'Not available on the public link', `<h1>Not available on the public link</h1><p>The analytics page lives on the admin console. Open the admin address printed on your computer.</p>`);
+  }
+  const method = req.raw.method || 'GET';
+  if (method !== 'GET' && method !== 'HEAD') return json(reply, 405, { error: 'method not allowed' });
+  return sendPage(reply, 'analytics.html');
+}
+
+async function rootRoute(req, reply) {
+  const ctx = req.ctx;
+  if (!ctx.isTunnel) return reply.code(302).header('Location', '/admin').send();
+  return serveShare(req, reply); // the public link serves shares only
 }
 
 /* ------------------------------------------------------------------ */
-/* Routing                                                             */
+/* Routing helpers for shares                                          */
 /* ------------------------------------------------------------------ */
 
 function parseSegments(rawPathname) {
@@ -742,133 +846,6 @@ function isReserved(p) {
   return RESERVED_PREFIXES.some((r) => p === r || p.startsWith(r + '/'));
 }
 
-/* Built frontend (web/ → npm run build → public/app) */
-const APP_TYPES = {
-  '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8',
-  '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml',
-  '.woff2': 'font/woff2', '.woff': 'font/woff',
-  '.map': 'application/json', '.txt': 'text/plain; charset=utf-8',
-  '.html': 'text/html; charset=utf-8',
-};
-
-function appPage(name) {
-  try { return fs.readFileSync(path.join(PUBLIC_DIR, 'app', name)); }
-  catch {
-    return Buffer.from(sendHTMLSource('UI not built', `<h1>UI not built</h1>
-<p>The interface is missing. Run <code>npm run build</code> inside the <code>web/</code> folder once, then restart.</p>`));
-  }
-}
-
-function sendHTMLSource(title, bodyHtml) {
-  return `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${escapeHTML(title)}</title><style>body{font:16px/1.6 system-ui,sans-serif;color:#1c1e21;display:grid;place-items:center;min-height:100vh;margin:0}main{max-width:34em;padding:2rem;text-align:center}h1{font-size:1.3rem;font-weight:600}p{color:#6b7280}</style><main>${bodyHtml}</main>`;
-}
-
-function serveAppAsset(req, res, pathname) {
-  if ((req.method || 'GET') !== 'GET' && req.method !== 'HEAD') { res.writeHead(405); return res.end(); }
-  let rel;
-  try { rel = decodeURIComponent(pathname.slice('/app/'.length)).replace(/\.\.+/g, ''); } catch { res.writeHead(400); return res.end(); }
-  const base = path.join(PUBLIC_DIR, 'app');
-  const fp = path.resolve(base, rel);
-  if (!fp.startsWith(base + path.sep)) { res.writeHead(403); return res.end(); }
-  let data;
-  try { data = fs.readFileSync(fp); } catch { res.writeHead(404); return res.end(); }
-  const type = APP_TYPES[path.extname(fp).toLowerCase()];
-  if (!type) { res.writeHead(404); return res.end(); } // stay tight: only known asset types
-  const immutable = pathname.startsWith('/app/assets/');
-  res.writeHead(200, { 'Content-Type': type, 'Cache-Control': immutable ? 'public, max-age=31536000, immutable' : 'no-cache', 'X-Robots-Tag': 'noindex' });
-  res.end(data);
-}
-
-function sendPage(res, name) {
-  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Robots-Tag': 'noindex' });
-  res.end(appPage(name));
-}
-
-function blockedPage(res, ip) {
-  return sendHTML(res, 403, 'Blocked', `<h1>Blocked</h1>
-<p>The owner of this server has blocked this address.</p>
-<p class="mono" style="font:12px monospace">${escapeHTML(ip || '')}</p>`);
-}
-
-async function handle(req, res) {
-  try {
-    if (req.url.startsWith('//')) return sendJSON(res, 400, { error: 'bad url' });
-    const url = new URL(req.url, 'http://internal');
-    const isTunnel = /\.trycloudflare\.com$/i.test(String(req.headers.host || '').toLowerCase());
-    const local = isLocalSocket(req.socket);
-    const ip = requestIP(req, isTunnel);
-    const kind = isTunnel ? 'tunnel' : local ? 'local' : 'lan';
-
-    // access log entry — filled in when the response finishes
-    tapResponse(res);
-    const ev = {
-      t: Date.now(), ip, method: req.method || 'GET', path: url.pathname,
-      status: 0, bytes: 0, ua: String(req.headers['user-agent'] || '').slice(0, 160),
-      share: null, kind, blocked: false,
-    };
-    res.on('finish', () => {
-      ev.status = res.statusCode;
-      ev.bytes = res.__bytes || 0;
-      if (!ev.share) {
-        const m = findMount(url.pathname, isTunnel);
-        ev.share = m ? m.path : null;
-      }
-      try { maybeRecord(ev, local); } catch { /* never break a response over logging */ }
-    });
-
-    // blocked clients: guests get rejected before anything is served
-    if (!local && isBlocked(ip)) {
-      ev.blocked = true;
-      return blockedPage(res, ip);
-    }
-
-    // Global small routes
-    if (url.pathname === '/favicon.ico') { res.writeHead(204); return res.end(); }
-    if (url.pathname === '/robots.txt') {
-      res.writeHead(200, { 'Content-Type': 'text/plain' });
-      return res.end('User-agent: *\nDisallow: /\n');
-    }
-    if (url.pathname === '/fonts.css' || url.pathname.startsWith('/fonts/')) {
-      const rel = url.pathname.slice(1).replace(/\.\./g, '');
-      const fp = path.join(PUBLIC_DIR, rel);
-      if (!fp.startsWith(PUBLIC_DIR)) { res.writeHead(403); return res.end(); }
-      const data = fs.existsSync(fp) ? fs.readFileSync(fp) : null;
-      if (!data) { res.writeHead(404); return res.end(); }
-      const type = fp.endsWith('.css') ? 'text/css; charset=utf-8' : fp.endsWith('.woff2') ? 'font/woff2' : 'application/octet-stream';
-      res.writeHead(200, { 'Content-Type': type, 'Cache-Control': 'public, max-age=86400' });
-      return res.end(data);
-    }
-    if (url.pathname === '/app' || url.pathname.startsWith('/app/')) {
-      return serveAppAsset(req, res, url.pathname);
-    }
-
-    if (url.pathname === '/' && !isTunnel) {
-      res.writeHead(302, { Location: '/admin' });
-      return res.end();
-    }
-
-    if (url.pathname === '/admin' || url.pathname.startsWith('/admin/')) {
-      return handleAdmin(req, res, url, { isTunnel, local });
-    }
-
-    if (url.pathname === '/analytics') {
-      if (isTunnel) {
-        return sendHTML(res, 403, 'Not available', `<h1>Not available on the public link</h1><p>The analytics page lives on the admin console. Open the admin address printed on your computer.</p>`);
-      }
-      if ((req.method || 'GET') !== 'GET' && req.method !== 'HEAD') return sendJSON(res, 405, { error: 'method not allowed' });
-      return sendPage(res, 'analytics.html');
-    }
-
-    // Everything else is a share
-    return serveShare(req, res, url, { isTunnel });
-  } catch (err) {
-    console.error('request error:', err);
-    if (!res.headersSent) sendJSON(res, 500, { error: 'internal error: ' + err.message });
-    else res.destroy();
-  }
-}
-
 /* ------------------------------------------------------------------ */
 /* Admin                                                               */
 /* ------------------------------------------------------------------ */
@@ -876,36 +853,38 @@ async function handle(req, res) {
 function canManage(req, url, ctx) {
   if (ctx.isTunnel) return false;
   if (ctx.local) return true;
-  const hdr = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
+  const hdr = String(req.raw.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
   const q = url.searchParams.get('t') || '';
   return timingSafeToken(hdr || q, config.adminToken);
 }
 
-function adminDenied(res, ctx) {
+function adminDenied(reply, ctx) {
   if (ctx.isTunnel) {
-    return sendHTML(res, 403, 'Not available', `<h1>Not available on the public link</h1>
+    return html(reply, 403, 'Not available on the public link', `<h1>Not available on the public link</h1>
 <p>This address is the public internet link — shares only. Open the link the app printed on your computer instead.</p>`);
   }
-  sendJSON(res, 401, { error: '🔒 admin token required', tokenRequired: true });
+  return json(reply, 401, { error: '🔒 admin token required', tokenRequired: true });
 }
 
-async function handleAdmin(req, res, url, ctx) {
-  const method = req.method || 'GET';
+async function adminRoute(req, reply) {
+  const url = new URL(req.raw.url || '/admin', 'http://internal');
+  const ctx = req.ctx;
+  const method = req.raw.method || 'GET';
 
   // Static admin page
   if (url.pathname === '/admin' && (method === 'GET' || method === 'HEAD')) {
     if (ctx.isTunnel) {
-      return sendHTML(res, 403, 'Not available', `<h1>Not available on the public link</h1><p>The admin console is only reachable from this computer, or from the network with an admin token.</p>`);
+      return html(reply, 403, 'Not available on the public link', `<h1>Not available on the public link</h1><p>The admin console is only reachable from this computer, or from the network with an admin token.</p>`);
     }
-    return sendPage(res, 'admin.html');
+    return sendPage(reply, 'admin.html');
   }
 
-  if (!canManage(req, url, ctx)) return adminDenied(res, ctx);
+  if (!canManage(req, url, ctx)) return adminDenied(reply, ctx);
 
   const api = url.pathname === '/admin/' ? null : url.pathname.slice('/admin/'.length);
 
   if (method === 'GET' && api === 'api/state') {
-    return sendJSON(res, 200, buildState(ctx));
+    return json(reply, 200, buildState(ctx));
   }
 
   /* ---- analytics: access log, clients, blocklist ---- */
@@ -917,15 +896,15 @@ async function handleAdmin(req, res, url, ctx) {
       .sort((a, b) => b[1].last - a[1].last)
       .slice(0, 400)
       .map(([cip, s]) => ({ ip: cip, ...s, blocked: isBlocked(cip) }));
-    return sendJSON(res, 200, { entries, ips, blocked: config.blockedIPs, kept: logStore.entries.length });
+    return json(reply, 200, { entries, ips, blocked: config.blockedIPs, kept: logStore.entries.length });
   }
 
   if (method === 'POST' && api === 'api/block') {
     let body;
-    try { body = JSON.parse(await readBody(req) || '{}'); } catch { return sendJSON(res, 400, { error: 'bad json' }); }
+    try { body = JSON.parse(req.body || '{}'); } catch { return json(reply, 400, { error: 'bad json' }); }
     const ip = normIP(body.ip);
-    if (!ip || ip === '?' || ip.length > 64) return sendJSON(res, 400, { error: 'bad ip' });
-    if (ip === '127.0.0.1' || ip === '::1') return sendJSON(res, 400, { error: "won't block this computer itself" });
+    if (!ip || ip === '?' || ip.length > 64) return json(reply, 400, { error: 'bad ip' });
+    if (ip === '127.0.0.1' || ip === '::1') return json(reply, 400, { error: "won't block this computer itself" });
     if (body.block === false) {
       config.blockedIPs = config.blockedIPs.filter((b) => b.ip !== ip);
     } else if (!config.blockedIPs.some((b) => b.ip === ip)) {
@@ -933,39 +912,38 @@ async function handleAdmin(req, res, url, ctx) {
       config.blockedIPs.push({ ip, ts: Date.now(), ...(note ? { note } : {}) });
     }
     saveConfig();
-    return sendJSON(res, 200, { ok: true, blocked: config.blockedIPs });
+    return json(reply, 200, { ok: true, blocked: config.blockedIPs });
   }
 
   if (method === 'POST' && api === 'api/logs/clear') {
     logStore.entries.length = 0;
     logStore.ips.clear();
     writeLogs();
-    return sendJSON(res, 200, { ok: true });
+    return json(reply, 200, { ok: true });
   }
 
   if (method === 'GET' && api === 'qr') {
     const link = url.searchParams.get('u') || '';
-    if (!/^https?:\/\/[^\s"'<>]+$/.test(link)) return sendJSON(res, 400, { error: 'bad url' });
-    if (!QRCode) { res.writeHead(501, { 'Content-Type': 'text/plain' }); return res.end('QR unavailable: npm package "qrcode" missing'); }
+    if (!/^https?:\/\/[^\s"'<>]+$/.test(link)) return json(reply, 400, { error: 'bad url' });
+    if (!QRCode) { reply.code(501).type('text/plain').send('QR unavailable: npm package "qrcode" missing'); return reply; }
     const svg = await QRCode.toString(link, { type: 'svg', margin: 1, width: 320, errorCorrectionLevel: 'M' });
-    res.writeHead(200, { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'no-store' });
-    return res.end(svg);
+    return reply.code(200).type('image/svg+xml').header('Cache-Control', 'no-store').send(svg);
   }
 
   if (method === 'GET' && api === 'api/fs') {
-    return handleFsBrowse(res, url.searchParams.get('path') || '');
+    return handleFsBrowse(reply, url.searchParams.get('path') || '');
   }
 
   if (method === 'POST' && api === 'api/mounts') {
     let body;
-    try { body = JSON.parse(await readBody(req) || '{}'); } catch { return sendJSON(res, 400, { error: 'bad json' }); }
+    try { body = JSON.parse(req.body || '{}'); } catch { return json(reply, 400, { error: 'bad json' }); }
     const p = normUrlPath(body.path);
-    if (!p) return sendJSON(res, 400, { error: 'web address must look like /photos (lowercase letters, numbers, - . _)' });
-    if (isReserved(p)) return sendJSON(res, 400, { error: `the address ${p} is reserved` });
-    if (config.mounts.some((m) => m.path === p)) return sendJSON(res, 400, { error: `the address ${p} is already used` });
+    if (!p) return json(reply, 400, { error: 'web address must look like /photos (lowercase letters, numbers, - . _)' });
+    if (isReserved(p)) return json(reply, 400, { error: `the address ${p} is reserved` });
+    if (config.mounts.some((m) => m.path === p)) return json(reply, 400, { error: `the address ${p} is already used` });
     const dir = String(body.dir || '').trim();
     const st = await fsp.stat(path.resolve(dir)).catch(() => null);
-    if (!st || !st.isDirectory()) return sendJSON(res, 400, { error: `no folder found at ${dir}` });
+    if (!st || !st.isDirectory()) return json(reply, 400, { error: `no folder found at ${dir}` });
     const mount = {
       id: crypto.randomUUID(),
       path: p,
@@ -976,44 +954,44 @@ async function handleAdmin(req, res, url, ctx) {
     config.mounts.push(mount);
     pushRecentDir(mount.dir);
     saveConfig();
-    return sendJSON(res, 200, { ok: true, mount: publicMount(mount) });
+    return json(reply, 200, { ok: true, mount: publicMount(mount) });
   }
 
   const mMatch = /^api\/mounts\/([A-Za-z0-9-]+)$/.exec(api || '');
   const mount = mMatch ? config.mounts.find((m) => m.id === mMatch[1]) : null;
-  if (mMatch && !mount) return sendJSON(res, 404, { error: 'share not found' });
+  if (mMatch && !mount) return json(reply, 404, { error: 'share not found' });
 
   if (method === 'PATCH' && mount) {
     let body;
-    try { body = JSON.parse(await readBody(req) || '{}'); } catch { return sendJSON(res, 400, { error: 'bad json' }); }
+    try { body = JSON.parse(req.body || '{}'); } catch { return json(reply, 400, { error: 'bad json' }); }
     if (body.path !== undefined) {
       const p = normUrlPath(body.path);
-      if (!p) return sendJSON(res, 400, { error: 'bad address' });
-      if (isReserved(p)) return sendJSON(res, 400, { error: 'reserved address' });
-      if (config.mounts.some((m) => m.path === p && m.id !== mount.id)) return sendJSON(res, 400, { error: 'address already used' });
+      if (!p) return json(reply, 400, { error: 'bad address' });
+      if (isReserved(p)) return json(reply, 400, { error: 'reserved address' });
+      if (config.mounts.some((m) => m.path === p && m.id !== mount.id)) return json(reply, 400, { error: 'address already used' });
       mount.path = p;
     }
     if (body.dir !== undefined) {
       const st = await fsp.stat(path.resolve(body.dir)).catch(() => null);
-      if (!st || !st.isDirectory()) return sendJSON(res, 400, { error: 'no such folder' });
+      if (!st || !st.isDirectory()) return json(reply, 400, { error: 'no such folder' });
       mount.dir = path.resolve(body.dir);
       pushRecentDir(mount.dir);
     }
     if (body.lan !== undefined) mount.lan = body.lan === true;
     if (body.public !== undefined) mount.public = body.public === true;
     saveConfig();
-    return sendJSON(res, 200, { ok: true, mount: publicMount(mount) });
+    return json(reply, 200, { ok: true, mount: publicMount(mount) });
   }
 
   if (method === 'DELETE' && mount) {
     config.mounts = config.mounts.filter((m) => m.id !== mount.id);
     saveConfig();
-    return sendJSON(res, 200, { ok: true });
+    return json(reply, 200, { ok: true });
   }
 
   if (method === 'PATCH' && api === 'api/settings') {
     let body;
-    try { body = JSON.parse(await readBody(req) || '{}'); } catch { return sendJSON(res, 200, { ok: false, error: 'bad json' }); }
+    try { body = JSON.parse(req.body || '{}'); } catch { return json(reply, 200, { ok: false, error: 'bad json' }); }
     try {
       // validate + persist first, answer, then restart listeners in the background
       if (body.httpPort !== undefined || body.httpsPort !== undefined) {
@@ -1030,25 +1008,25 @@ async function handleAdmin(req, res, url, ctx) {
       saveConfig();
       const tunnelWasRunning = !!tunnel.proc;
       if (tunnelWasRunning) stopTunnel();
-      sendJSON(res, 200, { ok: true, messages: ['settings applied'], tunnelRestarted: tunnelWasRunning });
+      json(reply, 200, { ok: true, messages: ['settings applied'], tunnelRestarted: tunnelWasRunning });
       setTimeout(() => {
         startServers().then(() => { if (tunnelWasRunning) startTunnel(); })
           .catch((err) => console.error('restart after settings change failed:', err));
       }, 400);
       return;
     } catch (err) {
-      return sendJSON(res, 400, { error: err.message });
+      return json(reply, 400, { error: err.message });
     }
   }
 
-  if (method === 'POST' && api === 'api/tunnel/start') return sendJSON(res, 200, await startTunnel());
-  if (method === 'POST' && api === 'api/tunnel/stop') return sendJSON(res, 200, stopTunnel());
+  if (method === 'POST' && api === 'api/tunnel/start') return json(reply, 200, await startTunnel());
+  if (method === 'POST' && api === 'api/tunnel/stop') return json(reply, 200, stopTunnel());
   if (method === 'POST' && api === 'api/tunnel/install') {
     const r = await installCloudflared();
-    return sendJSON(res, 200, { ...r, installState: tunnelState() });
+    return json(reply, 200, { ...r, installState: tunnelState() });
   }
 
-  sendJSON(res, 404, { error: 'unknown admin api' });
+  return json(reply, 404, { error: 'unknown admin api' });
 }
 
 function publicMount(m) {
@@ -1086,7 +1064,7 @@ function buildState(ctx) {
   };
 }
 
-async function handleFsBrowse(res, input) {
+async function handleFsBrowse(reply, input) {
   let p = String(input).trim().replace(/^["']|["']$/g, '');
   if (!p) {
     const drives = [];
@@ -1097,7 +1075,7 @@ async function handleFsBrowse(res, input) {
       }
       try { fs.statSync('C:\\'); } catch { /* C absent, rare */ }
     }
-    return sendJSON(res, 200, {
+    return json(reply, 200, {
       path: '',
       parent: null,
       name: process.platform === 'win32' ? 'This PC' : '/',
@@ -1107,8 +1085,8 @@ async function handleFsBrowse(res, input) {
   }
   let abs = path.resolve(p);
   let st = await fsp.stat(abs).catch(() => null);
-  if (!st) return sendJSON(res, 400, { error: `no folder found at ${abs}` });
-  if (!st.isDirectory()) return sendJSON(res, 400, { error: `${abs} is a file, not a folder` });
+  if (!st) return json(reply, 400, { error: `no folder found at ${abs}` });
+  if (!st.isDirectory()) return json(reply, 400, { error: `${abs} is a file, not a folder` });
   try { abs = await fsp.realpath(abs); } catch { /* keep resolved */ }
   let dirs = [];
   try {
@@ -1120,10 +1098,10 @@ async function handleFsBrowse(res, input) {
       .map((d) => ({ path: path.join(abs, d.name), name: d.name }))
       .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
   } catch (err) {
-    return sendJSON(res, 400, { error: `can't read ${abs}: ${err.message}` });
+    return json(reply, 400, { error: `can't read ${abs}: ${err.message}` });
   }
   const parent = path.dirname(abs);
-  sendJSON(res, 200, {
+  return json(reply, 200, {
     path: abs,
     parent: parent === abs ? null : parent,
     name: path.basename(abs) || abs,
@@ -1135,22 +1113,24 @@ async function handleFsBrowse(res, input) {
 /* Shares (guest view)                                                 */
 /* ------------------------------------------------------------------ */
 
-async function serveShare(req, res, url, ctx) {
+async function serveShare(req, reply) {
+  const url = new URL(req.raw.url || '/', 'http://internal');
+  const ctx = req.ctx || { isTunnel: TUNNEL_HOST_RE.test(String(req.raw.headers.host || '').toLowerCase()), local: false, ip: '?', kind: 'lan' };
   const parsedPath = parseSegments(url.pathname);
-  if (!parsedPath) return notFoundPage(res, 'This link is broken.');
+  if (!parsedPath) return notFoundPage(reply, 'This link is broken.');
   const segs = parsedPath.segs;
 
   if (!segs.length) {
-    if (ctx.isTunnel) return notFoundPage(res, 'Nothing is shared at the root of this link — add the share name to the URL.');
-    return notFoundPage(res, 'Nothing here. Ask the person sharing files for a direct link.');
+    if (ctx.isTunnel) return notFoundPage(reply, 'Nothing is shared at the root of this link — add the share name to the URL.');
+    return notFoundPage(reply, 'Nothing here. Ask the person sharing files for a direct link.');
   }
 
   const urlPath = '/' + segs.join('/');
   const wantPublic = ctx.isTunnel;
   const mount = findMount(urlPath, wantPublic);
   if (!mount || !(mount.lan || ctx.isTunnel)) {
-    if (ctx.isTunnel) return notFoundPage(res, 'Nothing is shared under this address on the public link.');
-    return notFoundPage(res, 'Nothing is shared under this address.');
+    if (ctx.isTunnel) return notFoundPage(reply, 'Nothing is shared under this address on the public link.');
+    return notFoundPage(reply, 'Nothing is shared under this address.');
   }
 
   // compute absolute path within the mount
@@ -1159,46 +1139,52 @@ async function serveShare(req, res, url, ctx) {
   for (const s of relSegs) abs = path.resolve(abs, s);
 
   const rootReal = await fsp.realpath(mount.dir).catch(() => null);
-  if (!rootReal) return notFoundPage(res, 'The folder this share points to no longer exists.');
+  if (!rootReal) return notFoundPage(reply, 'The folder this share points to no longer exists.');
   const absReal = await fsp.realpath(abs).catch(() => null);
-  if (!absReal) return notFoundPage(res, 'There is no file or folder at this address.');
+  if (!absReal) return notFoundPage(reply, 'There is no file or folder at this address.');
   const rootL = rootReal.toLowerCase();
   const absL = absReal.toLowerCase();
   if (absL !== rootL && !absL.startsWith(rootL + path.sep)) {
-    return notFoundPage(res, 'This link is broken.');
+    return notFoundPage(reply, 'This link is broken.');
   }
 
   let st;
-  try { st = await fsp.stat(absReal); } catch { return notFoundPage(res, 'This file is gone.'); }
+  try { st = await fsp.stat(absReal); } catch { return notFoundPage(reply, 'This file is gone.'); }
 
   if (st.isDirectory()) {
     if (!parsedPath.trailing && urlPath !== mount.path) {
-      res.writeHead(301, { Location: encodeURI(url.pathname + '/') });
-      return res.end();
+      return reply.code(301).header('Location', encodeURI(url.pathname + '/')).send();
     }
-    return serveDirectory(req, res, url, mount, urlPath, absReal, st);
+    return serveDirectory(req, reply, url, mount, urlPath, absReal, st);
   }
-  if (st.isFile()) return serveFile(req, res, absReal, st, { download: url.searchParams.get('dl') === '1' });
-  return notFoundPage(res, 'This item is not a viewable file or folder.');
+  if (st.isFile()) return serveFile(req, reply, absReal, st, { download: url.searchParams.get('dl') === '1' });
+  return notFoundPage(reply, 'This item is not a viewable file or folder.');
 }
 
-async function serveDirectory(req, res, url, mount, urlPath, absDir, st) {
+async function serveDirectory(req, reply, url, mount, urlPath, absDir, st) {
   if (url.searchParams.get('zip') === '1') {
     const last = urlPath.split('/').filter(Boolean).pop() || 'share';
-    try { return await sendZip(res, absDir, decodeURIComponent(last)); } catch (err) { return sendJSON(res, 400, { error: err.message }); }
+    let zipName;
+    try { zipName = decodeURIComponent(last); } catch (err) { return json(reply, 400, { error: err.message }); }
+    reply.hijack();
+    try {
+      await sendZip(reply.raw, absDir, zipName);
+    } catch (err) {
+      if (!reply.raw.headersSent) return json(reply, 400, { error: err.message });
+      try { reply.raw.destroy(); } catch { /* ignore */ }
+    }
+    return;
   }
-  const wantJSON = url.searchParams.get('json') === '1' || String(req.headers.accept || '').includes('application/json');
+  const wantJSON = url.searchParams.get('json') === '1' || String(req.raw.headers.accept || '').includes('application/json');
   if (wantJSON) {
     const entries = await listDir(absDir);
-    return sendJSON(res, 200, {
+    return json(reply, 200, {
       mount: mount.path,
       dir: urlPath,
       entries,
     });
   }
-  const html = appPage('browse.html');
-  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Robots-Tag': 'noindex' });
-  res.end(html);
+  return sendPage(reply, 'browse.html');
 }
 
 async function listDir(absDir) {
@@ -1224,7 +1210,9 @@ async function listDir(absDir) {
   return entries;
 }
 
-function serveFile(req, res, absFile, st, opts) {
+function serveFile(req, reply, absFile, st, opts) {
+  const res = reply.raw;
+  reply.hijack();
   const size = st.size;
   const type = mimeFor(absFile);
   const name = path.basename(absFile);
@@ -1235,7 +1223,7 @@ function serveFile(req, res, absFile, st, opts) {
     'Content-Disposition': contentDisposition(opts.download ? 'attachment' : 'inline', name),
     'X-Robots-Tag': 'noindex',
   };
-  const range = String(req.headers.range || '');
+  const range = String((req.raw.headers || {}).range || '');
   let start = 0, end = size - 1, status = 200;
 
   if (size === 0) {
@@ -1261,14 +1249,79 @@ function serveFile(req, res, absFile, st, opts) {
   const headers = { ...base, 'Content-Length': end - start + 1 };
   if (status === 206) headers['Content-Range'] = `bytes ${start}-${end}/${size}`;
   res.writeHead(status, headers);
-  if ((req.method || 'GET') === 'HEAD') return res.end();
+  if ((req.raw.method || 'GET') === 'HEAD') return res.end();
   const stream = fs.createReadStream(absFile, { start, end });
   stream.on('error', () => { try { res.destroy(); } catch {} });
   stream.pipe(res);
 }
 
-function notFoundPage(res, message) {
-  return sendHTML(res, 404, 'Nothing here', `<h1>Nothing here</h1><p>${escapeHTML(message)}</p>`);
+/* ------------------------------------------------------------------ */
+/* Servers (HTTP + HTTPS)                                              */
+/* ------------------------------------------------------------------ */
+
+const servers = {
+  http: null,
+  https: null,
+  httpPort: config.httpPort,
+  httpsPort: config.httpsPort,
+  httpsError: null,
+};
+
+function isAddrInUse(err) {
+  return !!err && (err.code === 'EADDRINUSE' || /address (already )?in use/i.test(String((err && err.message) || '')));
+}
+
+async function listenWithBump(makeApp, basePort, tries = 20) {
+  for (let i = 0; i < tries; i++) {
+    const port = basePort + i;
+    let app = null;
+    try {
+      app = makeApp();
+      await app.listen({ port, host: '0.0.0.0' });
+      return { app, port };
+    } catch (err) {
+      if (!isAddrInUse(err)) throw err;
+      if (app) { try { await app.close(); } catch { /* ignore */ } }
+    }
+  }
+  throw new Error(`no free port found from ${basePort}`);
+}
+
+async function closeServer(app) {
+  if (!app) return;
+  const raw = app.server;
+  await Promise.race([
+    app.close().catch(() => {}),
+    new Promise((r) => setTimeout(r, 1500)),
+  ]);
+  try { raw && raw.closeAllConnections && raw.closeAllConnections(); } catch { /* ignore */ }
+}
+
+async function startServers() {
+  await closeServer(servers.http);
+  await closeServer(servers.https);
+  servers.httpsError = null;
+
+  const httpRes = await listenWithBump(() => buildApp(null), config.httpPort);
+  servers.http = httpRes.app;
+  servers.httpPort = httpRes.port;
+  if (config.httpPort !== httpRes.port) config.httpPort = httpRes.port;
+
+  if (config.httpsEnabled) {
+    try {
+      const creds = ensureCertificate();
+      const httpsRes = await listenWithBump(() => buildApp(creds), config.httpsPort);
+      servers.https = httpsRes.app;
+      servers.httpsPort = httpsRes.port;
+      if (config.httpsPort !== httpsRes.port) config.httpsPort = httpsRes.port;
+    } catch (err) {
+      servers.https = null;
+      servers.httpsError = err.message;
+    }
+  } else {
+    servers.https = null;
+  }
+  saveConfig();
 }
 
 /* ------------------------------------------------------------------ */
