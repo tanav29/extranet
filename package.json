@@ -1,0 +1,20 @@
+{
+  "name": "extranet",
+  "version": "1.0.0",
+  "description": "Share folders from this computer over Wi-Fi or the internet, with a dead-simple viewer for guests.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "build:web": "npm --prefix web run build",
+    "setup:web": "npm --prefix web install"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "lucide-static": "^1.59.0",
+    "qrcode": "^1.5.4",
+    "selfsigned": "^2.4.1"
+  }
+}

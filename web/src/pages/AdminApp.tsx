@@ -1,0 +1,528 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  AlertTriangle, Copy, Download, ExternalLink, Folder, FolderOpen, Globe,
+  Info, KeyRound, LoaderCircle, Monitor, Plus, QrCode, Search, Trash2, Wifi,
+} from "lucide-react";
+import { toast } from "sonner";
+
+import { api, baseUrl, copyText, primaryIP } from "@/lib/api";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { Input } from "@/components/ui/input";
+import { Switch } from "@/components/ui/switch";
+import {
+  Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  AppShell, Gate, IconBtn, QRDialog, SectionCard, ScopeSwitches,
+} from "@/components/shared";
+import { cn } from "@/lib/utils";
+
+type State = any;
+
+export default function AdminApp() {
+  const [state, setState] = useState<State | null>(null);
+  const [needToken, setNeedToken] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+
+  const [qr, setQr] = useState<{ sharePath: string; tunnelUrl?: string | null } | null>(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      const s = await api<State>("/admin/api/state");
+      setState(s);
+      setNeedToken(false);
+      setLoaded(true);
+      return s;
+    } catch (e: any) {
+      if (e.status === 401) setNeedToken(true);
+      else toast.error(e.message);
+      return null;
+    }
+  }, []);
+
+  useEffect(() => { (async () => {
+    // seed a stored token if present, then try
+    try {
+      const s = await api<State>("/admin/api/state");
+      setState(s); setLoaded(true);
+    } catch (e: any) {
+      if (e.status === 401) setNeedToken(true);
+      else toast.error(e.message);
+    }
+  })(); }, []);
+
+  useEffect(() => {
+    const iv = setInterval(() => {
+      if (document.visibilityState !== "visible") return;
+      api("/admin/api/state").then((s) => setState(s)).catch(() => {});
+    }, 5000);
+    return () => clearInterval(iv);
+  }, []);
+
+  if (needToken) {
+    return <Gate onDone={() => refresh()} />;
+  }
+
+  if (!loaded || !state) {
+    return (
+      <div className="grid min-h-dvh place-items-center text-muted-foreground">
+        <LoaderCircle className="size-5 animate-spin" />
+      </div>
+    );
+  }
+
+  return (
+    <AppShell page="admin" host={state.hostname}>
+      <NetworkCard state={state} refresh={refresh} />
+      <TunnelCard state={state} refresh={refresh} onQR={(tunnelUrl) => setQr({ sharePath: "", tunnelUrl })} />
+      <SharesCard state={state} refresh={refresh} onQR={(sharePath) => setQr({ sharePath })} />
+      <TokenNote state={state} />
+      {qr && <QRDialog state={state} sharePath={qr.sharePath} tunnelUrl={qr.tunnelUrl} onClose={() => setQr(null)} />}
+    </AppShell>
+  );
+}
+
+/* ---------------------------------------------------------------- */
+/* Network card                                                      */
+/* ---------------------------------------------------------------- */
+
+function NetworkCard({ state, refresh }: { state: State; refresh: () => Promise<any> }) {
+  const [httpPort, setHttpPort] = useState(String(state.ports.http));
+  const [httpsPort, setHttpsPort] = useState(String(state.ports.https || state.configuredHttpsPort || ""));
+  const [httpsOn, setHttpsOn] = useState(!!state.ports.https);
+
+  useEffect(() => {
+    setHttpPort(String(state.ports.http));
+    setHttpsPort(String(state.ports.https || state.configuredHttpsPort || ""));
+    setHttpsOn(!!state.ports.https);
+  }, [state.ports.http, state.ports.https, state.configuredHttpsPort]);
+
+  async function apply() {
+    try {
+      const body: any = { httpPort: parseInt(httpPort, 10), httpsEnabled: httpsOn };
+      if (httpsOn) body.httpsPort = parseInt(httpsPort, 10);
+      const r = await api("/admin/api/settings", { method: "PATCH", body });
+      toast.success(r.tunnelRestarted ? "Applied — internet link restarting" : "Settings applied");
+      setTimeout(() => refresh(), 2000);
+    } catch (e: any) { toast.error(e.message); }
+  }
+
+  return (
+    <SectionCard icon={<Wifi />} title="This network">
+      <div>
+        {!state.ips.length && <Empty text="No network detected." />}
+        {(state.ips || []).map((it: any) => (
+          <div key={it.address} className="flex flex-wrap items-center gap-2 border-b px-4 py-2.5 last:border-b-0">
+            <Monitor className="size-4 shrink-0 text-muted-foreground" />
+            <div className="min-w-0 flex-1">
+              <div className="truncate font-mono text-[12.5px]">{it.address}</div>
+              <div className="text-[11.5px] text-muted-foreground">{it.name}</div>
+            </div>
+            <IconBtn title="Copy this address" onClick={() => copyText(it.address).then(() => toast.success("Address copied"))}><Copy /></IconBtn>
+            <IconBtn title="Open HTTPS" asChild>
+              <a href={`${baseUrl(state, it.address, true)}/`} target="_blank" rel="noopener"><ExternalLink /></a>
+            </IconBtn>
+          </div>
+        ))}
+      </div>
+      <div className="flex flex-wrap items-center gap-2 border-t px-4 py-3">
+        <span className="text-[11.5px] text-muted-foreground">Ports</span>
+        <Input type="number" className="w-20 font-mono text-xs" value={httpPort} onChange={(e) => setHttpPort(e.target.value)} />
+        <Input type="number" className="w-20 font-mono text-xs" value={httpsPort} disabled={!httpsOn} onChange={(e) => setHttpsPort(e.target.value)} />
+        <label className="flex items-center gap-1.5 text-[11.5px] font-medium text-muted-foreground" title="Self-signed certificate; devices show a warning the first time">
+          <Switch checked={httpsOn} onCheckedChange={(v) => setHttpsOn(v)} />
+          HTTPS
+        </label>
+        <div className="flex-1" />
+        <Button size="sm" onClick={apply}>Apply</Button>
+      </div>
+      <Note text="Guests on the same Wi-Fi open these links. HTTPS uses a self-signed certificate, so the first visit shows a warning — choose “proceed / visit website”." />
+      {state.httpsError && (
+        <div className="flex items-start gap-2 border-t px-4 py-2.5 text-[12px] text-amber-700">
+          <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
+          <span>HTTPS problem: {state.httpsError} — HTTP still works.</span>
+        </div>
+      )}
+    </SectionCard>
+  );
+}
+
+/* ---------------------------------------------------------------- */
+/* Tunnel card                                                       */
+/* ---------------------------------------------------------------- */
+
+function TunnelCard({ state, refresh, onQR }: { state: State; refresh: () => Promise<any>; onQR: (url: string) => void }) {
+  const t = state.tunnel || {};
+  const running = t.status === "running" && t.url;
+
+  async function start() {
+    toast("Starting the internet link…");
+    try {
+      const r = await api("/admin/api/tunnel/start", { method: "POST" });
+      await refresh();
+      if (!r.ok) toast.error(r.error || "Could not start the tunnel");
+      else if (r.url) toast.success("Internet link is live");
+    } catch (e: any) { toast.error(e.message); }
+  }
+
+  async function stop() {
+    try { await api("/admin/api/tunnel/stop", { method: "POST" }); await refresh(); } catch (e: any) { toast.error(e.message); }
+  }
+
+  async function install() {
+    toast("Downloading the Cloudflare helper… (one time)");
+    try {
+      const r = await api("/admin/api/tunnel/install", { method: "POST" });
+      await refresh();
+      if (r.ok) toast.success("Ready — start the link when you need it");
+      else toast.error(r.error || "Install failed");
+    } catch (e: any) { toast.error(e.message); }
+  }
+
+  return (
+    <SectionCard
+      icon={<Globe />}
+      title="Internet link"
+      action={
+        <Badge variant={running ? "default" : "secondary"} className="gap-1.5 font-normal">
+          <span className={cn("size-1.5 rounded-full", running ? "bg-primary-foreground" : "bg-muted-foreground/40")} />
+          {running ? "live" : t.status === "starting" ? "connecting" : "off"}
+        </Badge>
+      }
+    >
+      {running && (
+        <div className="flex flex-wrap items-center gap-2 border-b px-4 py-3">
+          <div className="min-w-0 flex-1">
+            <a href={`${t.url}/`} target="_blank" rel="noopener" className="block break-all font-mono text-[12.5px] text-primary underline underline-offset-2">
+              {t.url}/
+            </a>
+            <div className="mt-1 text-[11.5px] text-muted-foreground">Anyone with this link can open shares marked Internet, until you stop it.</div>
+          </div>
+          <IconBtn title="Copy public link" onClick={() => copyText((t.url || "") + "/").then(() => toast.success("Public link copied"))}><Copy /></IconBtn>
+          <IconBtn title="Show QR" onClick={() => onQR(t.url)}><QrCode /></IconBtn>
+          <Button size="sm" variant="destructive" onClick={stop}>Stop</Button>
+        </div>
+      )}
+      {t.status === "starting" && (
+        <div className="flex items-center gap-2 border-b px-4 py-3">
+          <LoaderCircle className="size-4 animate-spin text-muted-foreground" />
+          <span className="flex-1 text-[12.5px] text-muted-foreground">Connecting to Cloudflare…</span>
+          <Button size="sm" variant="outline" onClick={stop}>Cancel</Button>
+        </div>
+      )}
+      {!running && t.status !== "starting" && !t.installed && (
+        <div className="flex flex-wrap items-center gap-2 px-4 py-3">
+          <div className="min-w-0 flex-1">
+            <div className="text-[13px] font-medium">Not set up on this computer</div>
+            <div className="mt-0.5 text-[11.5px] text-muted-foreground">
+              Uses a small Cloudflare helper (about 40 MB, downloaded once). Quick links need no account, and each start gets a fresh address.
+            </div>
+          </div>
+          <Button size="sm" disabled={t.installing} onClick={install}>
+            {t.installing ? <LoaderCircle className="animate-spin" /> : <Download />}
+            {t.installing ? (t.installProgress || "downloading…") : "Set up"}
+          </Button>
+        </div>
+      )}
+      {!running && t.status !== "starting" && t.installed && t.error && (
+        <div className="flex flex-wrap items-center gap-2 px-4 py-3">
+          <AlertTriangle className="size-4 shrink-0 text-amber-600" />
+          <span className="min-w-0 flex-1 text-[12px] text-amber-700">{t.error}</span>
+          <Button size="sm" variant="outline" onClick={start}>Try again</Button>
+        </div>
+      )}
+      {!running && t.status !== "starting" && t.installed && !t.error && (
+        <div className="flex flex-wrap items-center gap-2 px-4 py-3">
+          <div className="min-w-0 flex-1">
+            <div className="text-[13px] font-medium">Share outside your Wi-Fi</div>
+            <div className="mt-0.5 text-[11.5px] text-muted-foreground">Creates a public link for shares marked Internet. Works anywhere, no account needed.</div>
+          </div>
+          <Button size="sm" onClick={start}>Start link</Button>
+        </div>
+      )}
+    </SectionCard>
+  );
+}
+
+/* ---------------------------------------------------------------- */
+/* Shares card                                                       */
+/* ---------------------------------------------------------------- */
+
+function slugOf(dir: string): string {
+  const base = dir.trim().split(/[\\/]/).filter(Boolean).pop() || "";
+  return "/" + base.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+}
+
+function SharesCard({ state, refresh, onQR }: { state: State; refresh: () => Promise<any>; onQR: (sharePath: string) => void }) {
+  const [addPath, setAddPath] = useState("");
+  const [addDir, setAddDir] = useState("");
+  const [nameTouched, setNameTouched] = useState(false);
+  const [lan, setLan] = useState(true);
+  const [pub, setPub] = useState(false);
+  const [pickerOpen, setPickerOpen] = useState(false);
+
+  const recents: string[] = state.recentDirs || [];
+  const mounts = state.mounts || [];
+
+  function setDir(d: string) {
+    setAddDir(d);
+    if (!nameTouched) setAddPath(slugOf(d));
+    setPickerOpen(false);
+  }
+
+  async function add() {
+    if (!addPath.trim() || !addDir.trim()) { toast.error("Pick a folder and a web address first"); return; }
+    try {
+      const body = { path: addPath, dir: addDir, lan, public: pub };
+      await api("/admin/api/mounts", { method: "POST", body });
+      setAddDir(""); setAddPath(""); setNameTouched(false);
+      await refresh();
+      toast.success(`Shared at ${slugOf(addPath) || addPath}`);
+    } catch (e: any) { toast.error(e.message); }
+  }
+
+  return (
+    <SectionCard
+      icon={<FolderOpen />}
+      title="Shared folders"
+      action={mounts.length ? <span className="text-[11.5px] text-muted-foreground">{mounts.length} shared</span> : undefined}
+    >
+      {!mounts.length && (
+        <div className="flex items-start gap-2.5 border-b px-4 py-3">
+          <FolderOpen className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+          <div>
+            <div className="text-[13px] font-medium">Nothing shared yet</div>
+            <div className="mt-0.5 text-[11.5px] text-muted-foreground">
+              Pick a folder below and press Share — guests get a clean page for browsing and downloading it.
+            </div>
+          </div>
+        </div>
+      )}
+      {mounts.map((m: any) => (
+        <ShareRow key={m.id} m={m} state={state} refresh={refresh} onQR={onQR} />
+      ))}
+
+      <div className="flex flex-col gap-2.5 border-t px-4 py-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <Input
+            className="w-36 font-mono text-xs"
+            placeholder="/web-address"
+            value={addPath}
+            onChange={(e) => { setAddPath(e.target.value); setNameTouched(true); }}
+          />
+          <Input
+            className="min-w-40 flex-1 font-mono text-xs"
+            placeholder="folder on this computer"
+            value={addDir}
+            onChange={(e) => setDir(e.target.value)}
+          />
+          <Button size="sm" variant="outline" onClick={() => setPickerOpen(true)}><Search />Browse</Button>
+        </div>
+        <div className="flex flex-wrap items-center gap-3">
+          <ScopeSwitches lan={lan} pub={pub} onLan={setLan} onPub={setPub} />
+          <span className="text-[11.5px] text-muted-foreground">— pick who can reach this share</span>
+          {recents.length > 0 && (
+            <div className="ml-auto flex max-w-full flex-wrap items-center gap-1.5">
+              <span className="text-[11px] text-muted-foreground">Recent:</span>
+              {recents.slice(0, 4).map((d) => (
+                <button
+                  key={d}
+                  title={d}
+                  onClick={() => setDir(d)}
+                  className="max-w-44 truncate rounded-md border bg-secondary px-2 py-1 font-mono text-[11px] text-secondary-foreground hover:bg-secondary/70"
+                >
+                  {d.split(/[\\/]/).filter(Boolean).pop() || d}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+        <div className="flex justify-end">
+          <Button size="sm" onClick={add}><Plus />Share</Button>
+        </div>
+        <NoteInline>
+          The web address is the path guests see, like <code className="font-mono">/photos</code>. Keep it short and simple.
+        </NoteInline>
+      </div>
+
+      <FolderPickerDialog
+        open={pickerOpen}
+        onOpenChange={setPickerOpen}
+        onUse={setDir}
+        recents={recents}
+      />
+    </SectionCard>
+  );
+}
+
+function ShareRow({ m, state, refresh, onQR }: { m: any; state: State; refresh: () => Promise<any>; onQR: (p: string) => void }) {
+  const [lan, setLan] = useState(!!m.lan);
+  const [pub, setPub] = useState(!!m.public);
+
+  useEffect(() => { setLan(!!m.lan); setPub(!!m.public); }, [m.lan, m.public]);
+
+  async function patch(next: { lan?: boolean; public?: boolean }) {
+    if (next.lan !== undefined) setLan(next.lan);
+    if (next.public !== undefined) setPub(next.public);
+    try {
+      await api(`/admin/api/mounts/${m.id}`, { method: "PATCH", body: { ...m, ...next } });
+    } catch (e: any) {
+      toast.error(e.message);
+      setLan(!!m.lan); setPub(!!m.public);
+    }
+  }
+
+  async function del() {
+    if (!confirm(`Stop sharing ${m.path}? Guests lose access immediately.`)) return;
+    try {
+      await api(`/admin/api/mounts/${m.id}`, { method: "DELETE" });
+      await refresh();
+      toast.success(`Stopped sharing ${m.path}`);
+    } catch (e: any) { toast.error(e.message); }
+  }
+
+  function shareUrl(): string {
+    const t = state?.tunnel || {};
+    if (t.status === "running" && t.url && m.public) return t.url + m.path + "/";
+    return baseUrl(state, primaryIP(state), true) + m.path + "/";
+  }
+
+  return (
+    <div className="flex flex-wrap items-center gap-2 border-b px-4 py-2.5 last:border-b-0">
+      <Folder className="size-4 shrink-0 text-zinc-500" />
+      <div className="min-w-0 flex-1">
+        <div className="truncate font-mono text-[12.5px]">{m.path}/</div>
+        <div className="truncate font-mono text-[11px] text-muted-foreground" title={m.dir}>{m.dir}</div>
+      </div>
+      <ScopeSwitches lan={lan} pub={pub} onLan={(v) => patch({ lan: v })} onPub={(v) => patch({ public: v })} />
+      <div className="flex items-center">
+        <IconBtn title="Copy link" onClick={() => copyText(shareUrl()).then(() => toast.success("Link copied"))}><Copy /></IconBtn>
+        <IconBtn title="Show QR" onClick={() => onQR(m.path)}><QrCode /></IconBtn>
+        <IconBtn title="Open in browser" asChild>
+          <a href={shareUrl()} target="_blank" rel="noopener"><ExternalLink /></a>
+        </IconBtn>
+        <IconBtn title="Stop sharing" destructive onClick={del}><Trash2 /></IconBtn>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------- */
+/* Folder picker dialog                                              */
+/* ---------------------------------------------------------------- */
+
+const PICKER_KEY = "extranet.lastPicker";
+
+function FolderPickerDialog({
+  open, onOpenChange, onUse, recents,
+}: { open: boolean; onOpenChange: (o: boolean) => void; onUse: (dir: string) => void; recents: string[] }) {
+  const [at, setAt] = useState("");
+  const [dirs, setDirs] = useState<{ path: string; name: string }[]>([]);
+  const [drives, setDrives] = useState(false);
+  const [err, setErr] = useState("");
+
+  const load = useCallback(async (p: string) => {
+    try {
+      const d = await api<any>(`/admin/api/fs?path=${encodeURIComponent(p)}`);
+      setAt(d.path);
+      setDirs(d.dirs || []);
+      setDrives(!!d.drives);
+      setErr("");
+      if (d.path) localStorage.setItem(PICKER_KEY, d.path);
+    } catch (e: any) {
+      setErr(e.message);
+      if (p) load(""); // fall back to root
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!open) return;
+    const last = localStorage.getItem(PICKER_KEY) || "";
+    load(last);
+  }, [open, load]);
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>Choose a folder</DialogTitle>
+          <DialogDescription className="break-all font-mono text-[11.5px]">{at || "This PC"}</DialogDescription>
+        </DialogHeader>
+
+        <div className="flex items-center gap-2">
+          <Button size="icon-sm" variant="outline" title="Up one level" onClick={() => load(at.replace(/[\\/][^\\/]+$/, "") || "")}>
+            ↑
+          </Button>
+          <div className="flex-1" />
+          <Button size="sm" disabled={!at} onClick={() => { onUse(at); onOpenChange(false); }}>Use this folder</Button>
+        </div>
+
+        {recents.length > 0 && (
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="text-[11px] text-muted-foreground">Shared before:</span>
+            {recents.slice(0, 6).map((d) => (
+              <button key={d} title={d} onClick={() => load(d)} className="max-w-52 truncate rounded-md border bg-secondary px-2 py-0.5 font-mono text-[11px] hover:bg-secondary/70">
+                {d.split(/[\\/]/).filter(Boolean).pop() || d}
+              </button>
+            ))}
+          </div>
+        )}
+
+        <div className="max-h-[46vh] overflow-y-auto rounded-md border">
+          {dirs.map((d) => (
+            <button
+              key={d.path}
+              onClick={() => load(d.path)}
+              className="flex w-full items-center gap-2 border-b px-3 py-2 text-left text-[12.5px] last:border-b-0 hover:bg-accent"
+            >
+              <Folder className="size-3.5 shrink-0 text-muted-foreground" />
+              <span className="truncate">{d.name}</span>
+              <span className="ml-auto truncate font-mono text-[10.5px] text-muted-foreground">{d.path}</span>
+            </button>
+          ))}
+          {!dirs.length && <div className="px-3 py-2 text-[12px] text-muted-foreground">{err || "No subfolders"}</div>}
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+/* ---------------------------------------------------------------- */
+/* Bits                                                              */
+/* ---------------------------------------------------------------- */
+
+function TokenNote({ state }: { state: State }) {
+  if (!state.token) return null;
+  return (
+    <div className="flex items-center justify-center gap-2 pt-1 text-center text-[12px] text-muted-foreground">
+      <KeyRound className="size-3.5" />
+      <span>
+        Admin token <code className="rounded bg-muted px-1 font-mono text-[11px]">{state.token}</code> — needed when managing from another device
+      </span>
+      <IconBtn title="Copy token" onClick={() => copyText(state.token).then(() => toast.success("Token copied"))}><Copy /></IconBtn>
+    </div>
+  );
+}
+
+function Note({ text }: { text: string }) {
+  return (
+    <div className="flex items-start gap-2 border-t px-4 py-2.5 text-[11.5px] leading-relaxed text-muted-foreground">
+      <Info className="mt-0.5 size-3.5 shrink-0" />
+      <span>{text}</span>
+    </div>
+  );
+}
+
+function NoteInline({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="flex items-start gap-2 text-[11.5px] leading-relaxed text-muted-foreground">
+      <Info className="mt-0.5 size-3.5 shrink-0" />
+      <span>{children}</span>
+    </div>
+  );
+}
+
+function Empty({ text }: { text: string }) {
+  return <div className="border-b px-4 py-3 text-[12.5px] text-muted-foreground last:border-b-0">{text}</div>;
+}
