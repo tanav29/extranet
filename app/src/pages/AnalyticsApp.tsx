@@ -9,7 +9,6 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Switch } from "@/components/ui/switch";
 import { Input } from "@/components/ui/input";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
 } from "@/components/ui/table";
@@ -95,81 +94,82 @@ export default function AnalyticsApp() {
 
   return (
     <AppShell page="analytics" host={host || undefined}>
-      <div className="flex flex-wrap items-end gap-3 pb-4">
-        <div className="mr-auto">
-          <h1 className="flex items-center gap-2 text-lg font-semibold tracking-tight">
-            <BarChart3 className="size-4" /> Analytics
-          </h1>
-          <p className="mt-0.5 text-[12px] text-muted-foreground">
-            Who opened your shares, what they took, and who to keep out.
-          </p>
-        </div>
-        <label className="flex items-center gap-2 text-[11.5px] text-muted-foreground">
-          <Switch checked={auto} onCheckedChange={setAuto} /> live
-        </label>
-        <Button size="sm" variant="outline" onClick={() => refresh()}><RefreshCw /> Refresh</Button>
-        <Button size="sm" variant="ghost" className="text-destructive hover:bg-red-50" onClick={clearLogs}><Trash2 /> Clear</Button>
-      </div>
-
-      {!data ? (
-        <div className="grid place-items-center py-24 text-muted-foreground"><LoaderCircle className="size-5 animate-spin" /></div>
-      ) : (
-        <>
-          <div className="mb-4 grid grid-cols-2 gap-3 lg:grid-cols-4">
-            <Stat icon={<Activity />} label={`Requests (last ${data.kept})`} value={String(totals.requests)} />
-            <Stat icon={<Users />} label="Clients seen" value={String(totals.clients)} />
-            <Stat icon={<Download />} label="Data served" value={fmtBytes(totals.bytes)} />
-            <Stat icon={<ShieldBan />} label="Blocked hits" value={String(totals.blockedHits)} tone={totals.blockedHits ? "warn" : undefined} />
+      <div className="mx-auto flex h-full w-full max-w-7xl flex-col gap-4 px-5 py-5 xl:px-8 max-lg:pb-24">
+        {/* header row */}
+        <div className="flex flex-wrap items-end gap-3">
+          <div className="mr-auto">
+            <h1 className="flex items-center gap-2 text-[15.5px] font-semibold tracking-tight">
+              <BarChart3 className="size-4" /> Analytics
+            </h1>
+            <p className="mt-0.5 text-[12px] text-muted-foreground">
+              Who opened your shares, what they took, and who to keep out.
+            </p>
           </div>
+          <label className="flex items-center gap-2 text-[11.5px] text-muted-foreground">
+            <Switch checked={auto} onCheckedChange={setAuto} /> live
+          </label>
+          <Button size="sm" variant="outline" onClick={() => refresh()}><RefreshCw /> Refresh</Button>
+          <Button size="sm" variant="ghost" className="text-destructive hover:bg-destructive/10" onClick={clearLogs}><Trash2 /> Clear</Button>
+        </div>
 
-          <Tabs defaultValue="requests">
-            <TabsList className="mb-3">
-              <TabsTrigger value="requests">Requests</TabsTrigger>
-              <TabsTrigger value="clients">Clients</TabsTrigger>
-              <TabsTrigger value="blocked">Blocked {data.blocked.length ? `(${data.blocked.length})` : ""}</TabsTrigger>
-            </TabsList>
+        {!data ? (
+          <div className="grid flex-1 place-items-center text-muted-foreground"><LoaderCircle className="size-5 animate-spin" /></div>
+        ) : (
+          <>
+            {/* facts */}
+            <div className="grid shrink-0 grid-cols-2 gap-3 lg:grid-cols-4">
+              <Stat icon={<Activity />} label={`Requests (of ${data.kept})`} value={String(totals.requests)} />
+              <Stat icon={<Users />} label="Clients seen" value={String(totals.clients)} />
+              <Stat icon={<Download />} label="Data served" value={fmtBytes(totals.bytes)} />
+              <Stat icon={<ShieldBan />} label="Blocked hits" value={String(totals.blockedHits)} tone={totals.blockedHits ? "warn" : undefined} />
+            </div>
 
-            <TabsContent value="requests">
-              <SectionCard icon={<Activity />} title="Request log" action={
-                <div className="relative">
-                  <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
-                  <Input
-                    className="h-8 w-52 pl-8 text-xs"
-                    placeholder="Filter by path or IP"
-                    value={filter}
-                    onChange={(e) => setFilter(e.target.value)}
-                  />
-                </div>
-              }>
-                <div className="max-h-[62vh] overflow-y-auto">
+            {/* two panes: the log on the left, people on the right */}
+            <div className="grid min-h-0 flex-1 grid-cols-1 items-stretch gap-4 lg:grid-cols-[minmax(0,1fr)_370px] max-lg:items-start">
+              <SectionCard
+                icon={<Activity />}
+                title="Request log"
+                className="flex min-h-0 flex-col"
+                action={
+                  <div className="relative">
+                    <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+                    <Input
+                      className="h-8 w-48 pl-8 text-xs"
+                      placeholder="Filter by path or IP"
+                      value={filter}
+                      onChange={(e) => setFilter(e.target.value)}
+                    />
+                  </div>
+                }
+              >
+                <div className="min-h-0 max-h-[46vh] flex-1 overflow-y-auto lg:max-h-none">
                   <LogsTable entries={entries} />
                 </div>
               </SectionCard>
-            </TabsContent>
 
-            <TabsContent value="clients">
-              <SectionCard icon={<Users />} title="Clients that reached this computer">
-                <div className="max-h-[62vh] overflow-y-auto">
-                  <ClientsTable ips={data.ips} localIPs={["127.0.0.1", "::1"]} onBlock={setBlocked} />
-                </div>
-              </SectionCard>
-            </TabsContent>
-
-            <TabsContent value="blocked">
-              <SectionCard icon={<ShieldBan />} title="Blocked addresses">
-                <BlockedTable blocked={data.blocked} onUnblock={setBlocked} />
-              </SectionCard>
-            </TabsContent>
-          </Tabs>
-        </>
-      )}
+              <div className="grid min-h-0 grid-cols-1 gap-4">
+                <SectionCard icon={<Users />} title="Clients" className="flex min-h-0 flex-col" bodyClass="flex min-h-0 flex-1 flex-col">
+                  <div className="min-h-0 max-h-[46vh] flex-1 overflow-y-auto lg:max-h-none">
+                    <ClientsTable ips={data.ips} localIPs={["127.0.0.1", "::1"]} onBlock={setBlocked} />
+                  </div>
+                </SectionCard>
+                <SectionCard icon={<ShieldBan />} title={`Blocked${data.blocked.length ? ` (${data.blocked.length})` : ""}`}>
+                  <div className="max-h-40 overflow-y-auto">
+                    <BlockedTable blocked={data.blocked} onUnblock={setBlocked} />
+                  </div>
+                </SectionCard>
+              </div>
+            </div>
+          </>
+        )}
+      </div>
     </AppShell>
   );
 }
 
 function Stat({ icon, label, value, tone }: { icon: React.ReactNode; label: string; value: string; tone?: "warn" }) {
   return (
-    <div className="rounded-xl border bg-card px-4 py-3">
+    <div className="rounded-xl border bg-card px-4 py-3 shadow-sm">
       <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
         <span className="[&_svg]:size-3.5">{icon}</span>
         <span className="truncate">{label}</span>
@@ -183,10 +183,10 @@ function Stat({ icon, label, value, tone }: { icon: React.ReactNode; label: stri
 
 function StatusBadge({ status }: { status: number }) {
   const tone =
-    status >= 500 ? "bg-red-100 text-red-800 border-red-200" :
-    status >= 400 ? "bg-amber-100 text-amber-800 border-amber-200" :
-    status >= 300 ? "bg-zinc-100 text-zinc-600 border-zinc-200" :
-    "bg-emerald-100 text-emerald-800 border-emerald-200";
+    status >= 500 ? "bg-red-100 text-red-800 border-red-200 dark:bg-red-500/15 dark:text-red-300 dark:border-red-500/30" :
+    status >= 400 ? "bg-amber-100 text-amber-800 border-amber-200 dark:bg-amber-500/15 dark:text-amber-300 dark:border-amber-500/30" :
+    status >= 300 ? "bg-zinc-100 text-zinc-600 border-zinc-200 dark:bg-zinc-500/15 dark:text-zinc-300 dark:border-zinc-500/30" :
+    "bg-emerald-100 text-emerald-800 border-emerald-200 dark:bg-emerald-500/15 dark:text-emerald-300 dark:border-emerald-500/30";
   return (
     <Badge variant="outline" className={`h-5 w-12 justify-center border px-1 font-mono text-[10.5px] ${tone}`}>
       {status}
@@ -222,7 +222,7 @@ function LogsTable({ entries }: { entries: Entry[] }) {
       </TableHeader>
       <TableBody>
         {entries.map((e, i) => (
-          <TableRow key={i} className={e.blocked ? "bg-red-50/50" : undefined}>
+          <TableRow key={i} className={e.blocked ? "bg-red-50/50 dark:bg-red-500/10" : undefined}>
             <TableCell className="pl-4 font-mono text-[11px] text-muted-foreground">
               <span title={fmtTime(e.t)}>{fmtClock(e.t)}</span>
             </TableCell>
@@ -287,7 +287,7 @@ function ClientsTable({ ips, localIPs, onBlock }: { ips: Client[]; localIPs: str
                 ) : c.blocked ? (
                   <Button size="sm" variant="outline" onClick={() => onBlock(c.ip, false)}>Unblock</Button>
                 ) : (
-                  <Button size="sm" variant="outline" className="text-destructive hover:bg-red-50" onClick={() => onBlock(c.ip, true)}>
+                  <Button size="sm" variant="outline" className="text-destructive hover:bg-destructive/10" onClick={() => onBlock(c.ip, true)}>
                     <Ban /> Block
                   </Button>
                 )}
@@ -301,7 +301,7 @@ function ClientsTable({ ips, localIPs, onBlock }: { ips: Client[]; localIPs: str
 }
 
 function BlockedTable({ blocked, onUnblock }: { blocked: { ip: string; ts: number; note?: string }[]; onUnblock: (ip: string, block: boolean) => void }) {
-  if (!blocked.length) return <EmptyLog text="Nobody is blocked. Block a client from the Clients tab and their requests get rejected hereafter." />;
+  if (!blocked.length) return <EmptyLog text="Nobody is blocked. Block a client from the Clients pane and their requests get rejected hereafter." />;
   return (
     <Table>
       <TableHeader>

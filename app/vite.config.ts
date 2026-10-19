@@ -3,7 +3,7 @@ import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import path from "node:path";
 
-/* The running Fastify server (npm start at the repo root). Used both as a dev
+/* The running Fastify server (npx extranet / npm start at the repo root). Used both as a dev
  * proxy so the admin/analytics pages work with hot reload, and as the host of
  * the finished bundle in public/app. */
 const backend = process.env.VITE_BACKEND || "http://localhost:5050";

@@ -6,7 +6,7 @@
  *  - Serves each configured folder ("share") under a URL path, e.g. /photos
  *  - Can also expose a port of this computer under a URL path (/webapp → 127.0.0.1:3000)
  *  - Shares can be locked with a 6-digit PIN; guests enter it once (cookie) or pass it in the URL (?pin=123456)
- *  - The React app in web/ compiles into public/app and is served statically:
+ *  - The React app in app/ compiles into public/app and is served statically:
  *    admin console (/admin), guest browser (any share path), analytics (/analytics)
  *  - LAN over HTTP, plus a Cloudflare quick-tunnel for internet access
  *  - Admin console at /admin (this machine only, or with a token)
@@ -26,11 +26,23 @@ const zlib = require('zlib');
 const { spawn, spawnSync } = require('child_process');
 const Fastify = require('fastify');
 
-const ROOT = __dirname;
-const PUBLIC_DIR = path.join(ROOT, 'public');
-const DATA_DIR = path.join(ROOT, 'data');
+/*
+ * Paths. The package layout is:  bin/ (launcher) + server/ (this app) +
+ * public/ (the compiled UI, served statically) + app/ (the Vite source).
+ * Everything that changes at runtime (config, logs, the cloudflared helper)
+ * lives in a data dir: EXTRANET_DATA_DIR, the repo's ./data when present, or
+ * ~/.extranet/data for a globally installed copy.
+ */
+const ROOT = path.join(__dirname, '..');
+const PUBLIC_DIR = process.env.EXTRANET_PUBLIC_DIR
+  ? path.resolve(process.env.EXTRANET_PUBLIC_DIR)
+  : path.join(ROOT, 'public');
+const DATA_DIR = process.env.EXTRANET_DATA_DIR
+  ? path.resolve(process.env.EXTRANET_DATA_DIR)
+  : (fs.existsSync(path.join(ROOT, 'data')) ? path.join(ROOT, 'data')
+    : path.join(os.homedir(), '.extranet', 'data'));
 const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
-const BIN_DIR = path.join(ROOT, 'bin');
+const BIN_DIR = path.join(DATA_DIR, 'bin');
 
 const TUNNEL_HOST_RE = /\.trycloudflare\.com$/i;
 
@@ -732,7 +744,7 @@ function stopTunnel() {
 /* The Fastify app                                                     */
 /* ------------------------------------------------------------------ */
 
-/* Built frontend (web/ → npm run build → public/app) */
+/* Built frontend (app/ → npm run build → public/app) */
 const APP_TYPES = {
   '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8',
   '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml',
@@ -745,7 +757,7 @@ function appPage(name) {
   try { return fs.readFileSync(path.join(PUBLIC_DIR, 'app', name)); }
   catch {
     return Buffer.from(pageHTML('UI not built', `<h1>UI not built</h1>
-<p>The interface is missing. Run <code>npm run build</code> inside the <code>web/</code> folder once, then restart.</p>`));
+<p>The interface is missing. Run <code>npx extranet --build</code> (or <code>npm run build --prefix app</code>) once, then restart.</p>`));
   }
 }
 
@@ -1556,6 +1568,10 @@ const servers = {
   httpPort: config.httpPort,
 };
 
+/* an EXTRANET_PORT / --port flag wins for one run — never persisted */
+const ENV_PORT = Number.parseInt(process.env.EXTRANET_PORT || '', 10);
+const wantPort = (Number.isInteger(ENV_PORT) && ENV_PORT >= 1024 && ENV_PORT <= 65535) ? ENV_PORT : null;
+
 function isAddrInUse(err) {
   return !!err && (err.code === 'EADDRINUSE' || /address (already )?in use/i.test(String((err && err.message) || '')));
 }
@@ -1588,10 +1604,10 @@ async function closeServer(app) {
 
 async function startServers() {
   await closeServer(servers.http);
-  const httpRes = await listenWithBump(() => buildApp(), config.httpPort);
+  const httpRes = await listenWithBump(() => buildApp(), wantPort || config.httpPort);
   servers.http = httpRes.app;
   servers.httpPort = httpRes.port;
-  if (config.httpPort !== httpRes.port) config.httpPort = httpRes.port;
+  if (!wantPort && config.httpPort !== httpRes.port) config.httpPort = httpRes.port;
   saveConfig();
 }
 

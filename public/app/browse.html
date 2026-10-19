@@ -6,11 +6,19 @@
     <meta name="robots" content="noindex" />
     <title>Share</title>
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📁</text></svg>" />
+    <script>
+      try {
+        var t = localStorage.getItem("extranet.theme");
+        if (t === "dark" || (!t && window.matchMedia && matchMedia("(prefers-color-scheme: dark)").matches)) {
+          document.documentElement.classList.add("dark");
+        }
+      } catch (e) { /* no storage */ }
+    </script>
     <link rel="stylesheet" href="/fonts.css" />
-    <script type="module" crossorigin src="/app/assets/browse-DviMNY_K.js"></script>
-    <link rel="modulepreload" crossorigin href="/app/assets/sonner-CenZIpw7.js">
-    <link rel="modulepreload" crossorigin href="/app/assets/folder-DGWZbbox.js">
-    <link rel="stylesheet" crossorigin href="/app/assets/sonner-ChqIX9v0.css">
+    <script type="module" crossorigin src="/app/assets/browse-j9xOzKVJ.js"></script>
+    <link rel="modulepreload" crossorigin href="/app/assets/sonner-B0sPMWTe.js">
+    <link rel="modulepreload" crossorigin href="/app/assets/folder-BlRJoxev.js">
+    <link rel="stylesheet" crossorigin href="/app/assets/sonner-CZobs2M3.css">
   </head>
   <body>
     <div id="root"></div>

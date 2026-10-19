@@ -4,7 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { pathToFileURL } from "node:url";
 
-const base = path.dirname(fileURLToPath(import.meta.url)); // web/
+const base = path.dirname(fileURLToPath(import.meta.url)); // app/
 const pub = path.resolve(base, "..", "public", "app", "assets");
 
 function entryChunk(prefix) {

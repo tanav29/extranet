@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   Archive, ChevronLeft, ChevronRight, Copy, Download, File, FileText, Film, Folder, ImageIcon,
-  Link2, Music, Search, X,
+  LayoutGrid, Link2, List, Music, Search, X,
 } from "lucide-react";
 import { toast } from "sonner";
 import { copyText, fmtSize } from "@/lib/api";
+import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Dialog, DialogContent } from "@/components/ui/dialog";
@@ -34,11 +35,15 @@ function decodeSafe(s: string) { try { return decodeURIComponent(s); } catch { r
 
 type Entry = { name: string; dir: boolean; size: number | null; mtime: number | null };
 
+const VIEW_KEY = "extranet.browseView";
+
 export default function BrowseApp() {
   const [meta, setMeta] = useState<{ mount: string; dir: string; entries: Entry[] } | null>(null);
   const [error, setError] = useState("");
   const [filter, setFilter] = useState("");
   const [previewIdx, setPreviewIdx] = useState(-1);
+  const [view, setView] = useState<"list" | "grid">(() =>
+    localStorage.getItem(VIEW_KEY) === "grid" ? "grid" : "list");
 
   const load = useCallback(async () => {
     try {
@@ -59,6 +64,12 @@ export default function BrowseApp() {
   const shown = filter
     ? entries.filter((e) => e.name.toLowerCase().includes(filter.toLowerCase()))
     : entries;
+  const shownBytes = shown.reduce((a, e) => a + (e.dir ? 0 : (e.size || 0)), 0);
+
+  function switchView(v: "list" | "grid") {
+    setView(v);
+    try { localStorage.setItem(VIEW_KEY, v); } catch { /* private mode */ }
+  }
 
   function openPreview(name: string) {
     const i = files.findIndex((f) => f.name === name);
@@ -92,13 +103,13 @@ export default function BrowseApp() {
   useEffect(() => { document.title = title + " — shared files"; }, [title]);
 
   return (
-    <div className="min-h-dvh">
+    <div className="flex min-h-dvh flex-col">
       <header className="sticky top-0 z-10 border-b bg-background/90 backdrop-blur">
-        <div className="mx-auto max-w-3xl px-5 pb-3 pt-4">
+        <div className="mx-auto max-w-6xl px-5 pb-3 pt-4">
           <nav className="mb-0.5 flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[12px] text-muted-foreground">
             <Crumbs meta={meta} />
           </nav>
-          <div className="flex items-center gap-2.5">
+          <div className="mt-1 flex items-center gap-2.5">
             <h1 className="min-w-0 truncate text-lg font-semibold tracking-tight">{title}</h1>
             <span className="shrink-0 text-[12px] tabular-nums text-muted-foreground">
               {entries.length
@@ -108,6 +119,18 @@ export default function BrowseApp() {
                 : ""}
             </span>
             <div className="flex-1" />
+            {entries.length >= 6 && (
+              <div className="relative hidden sm:block">
+                <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+                <Input
+                  className="h-8 w-48 pl-8 text-xs"
+                  placeholder="Search this folder"
+                  value={filter}
+                  onChange={(e) => setFilter(e.target.value)}
+                />
+              </div>
+            )}
+            <ViewToggle view={view} onChange={switchView} />
             <Button variant="outline" size="icon-sm" title="Copy link to this folder"
               onClick={() => copyText(location.origin + dirUrl()).then(() => toast.success("Link copied"))}>
               <Link2 />
@@ -118,10 +141,21 @@ export default function BrowseApp() {
               </Button>
             )}
           </div>
+          {entries.length >= 6 && (
+            <div className="relative mt-2 sm:hidden">
+              <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                className="h-8 pl-8 text-xs"
+                placeholder="Search this folder"
+                value={filter}
+                onChange={(e) => setFilter(e.target.value)}
+              />
+            </div>
+          )}
         </div>
       </header>
 
-      <main className="mx-auto max-w-3xl px-5 pb-28 pt-2">
+      <main className="mx-auto w-full max-w-6xl flex-1 px-5 pb-24 pt-4">
         {error && (
           <div className="grid place-items-center gap-2 py-20 text-center">
             <File className="size-8 text-muted-foreground/40" />
@@ -131,17 +165,6 @@ export default function BrowseApp() {
         )}
         {!error && meta && (
           <>
-            {entries.length >= 6 && (
-              <div className="relative mt-2 mb-1">
-                <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-                <Input
-                  className="pl-9"
-                  placeholder="Search this folder"
-                  value={filter}
-                  onChange={(e) => setFilter(e.target.value)}
-                />
-              </div>
-            )}
             {!entries.length && (
               <div className="grid place-items-center gap-2 py-20 text-center text-muted-foreground">
                 <Folder className="size-8 text-muted-foreground/40" />
@@ -154,12 +177,28 @@ export default function BrowseApp() {
                 <p className="text-[13px]">No matches for “{filter}”.</p>
               </div>
             )}
-            <div className="divide-y">
-              {shown.map((e) => <Row key={e.name} e={e} onPreview={() => openPreview(e.name)} />)}
-            </div>
+            {view === "grid"
+              ? <GridView shown={shown} onPreview={openPreview} />
+              : <ListView shown={shown} onPreview={openPreview} />}
           </>
         )}
       </main>
+
+      {/* reading status bar */}
+      {!error && meta && !!entries.length && (
+        <footer className="sticky bottom-0 border-t bg-background/90 backdrop-blur">
+          <div className="mx-auto flex w-full max-w-6xl flex-wrap items-center gap-x-3 gap-y-0.5 px-5 py-2 text-[11.5px] text-muted-foreground">
+            <span className="tabular-nums">
+              {shown.length === entries.length
+                ? `${entries.length} items`
+                : `${shown.length} of ${entries.length} items`}
+              {shownBytes > 0 && <> · {fmtSize(shownBytes)}</>}
+            </span>
+            <div className="flex-1" />
+            <span>files stay on this computer — read-only</span>
+          </div>
+        </footer>
+      )}
 
       {previewIdx >= 0 && files[previewIdx] && (
         <PreviewDialog
@@ -172,6 +211,133 @@ export default function BrowseApp() {
     </div>
   );
 }
+
+/* ---- view toggle ---- */
+
+function ViewToggle({ view, onChange }: { view: "list" | "grid"; onChange: (v: "list" | "grid") => void }) {
+  const opt = (v: "list" | "grid", icon: React.ReactNode, title: string) => (
+    <Button
+      variant="ghost"
+      size="icon-sm"
+      title={title}
+      aria-pressed={view === v}
+      onClick={() => onChange(v)}
+      className={cn(view === v ? "bg-muted text-foreground" : "text-muted-foreground")}
+    >
+      {icon}
+    </Button>
+  );
+  return (
+    <div className="flex items-center rounded-md border p-0.5">
+      {opt("list", <List />, "List view")}
+      {opt("grid", <LayoutGrid />, "Grid view")}
+    </div>
+  );
+}
+
+/* ---- list view ---- */
+
+function ListView({ shown, onPreview }: { shown: Entry[]; onPreview: (n: string) => void }) {
+  return (
+    <div className="divide-y">
+      {shown.map((e) => (
+        <Row key={e.name} e={e} onPreview={() => onPreview(e.name)} />
+      ))}
+    </div>
+  );
+}
+
+function Row({ e, onPreview }: { e: Entry; onPreview: () => void }) {
+  const Icon = e.dir ? Folder : CAT_ICON[catOf(e.name)] || File;
+  return (
+    <div className="group flex items-center gap-3 rounded-md px-2 py-2 -mx-2 hover:bg-accent/50">
+      <Icon className={`size-4 shrink-0 ${e.dir ? "text-zinc-500" : "text-muted-foreground"}`} />
+      {e.dir ? (
+        <a href={dirUrl() + seg(e.name) + "/"} className="min-w-0 flex-1 truncate text-[13.5px] hover:underline">
+          {e.name}
+        </a>
+      ) : (
+        <button onClick={onPreview} className="min-w-0 flex-1 truncate text-left text-[13.5px] hover:underline" title={e.name}>
+          {e.name}
+        </button>
+      )}
+      <span className="shrink-0 text-[12px] tabular-nums text-muted-foreground">{e.dir ? "" : fmtSize(e.size)}</span>
+      {!e.dir ? (
+        <a
+          href={fileUrl(e.name) + "?dl=1"}
+          download={e.name}
+          title={"Download " + e.name}
+          className="inline-flex size-8 shrink-0 items-center justify-center rounded-md text-muted-foreground opacity-0 transition-opacity hover:bg-accent hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100"
+        >
+          <Download className="size-4" />
+        </a>
+      ) : (
+        <span className="inline-block size-8 shrink-0" />
+      )}
+    </div>
+  );
+}
+
+/* ---- grid view ---- */
+
+function GridView({ shown, onPreview }: { shown: Entry[]; onPreview: (n: string) => void }) {
+  return (
+    <div className="grid grid-cols-[repeat(auto-fill,minmax(140px,1fr))] gap-2.5">
+      {shown.map((e) => (
+        <Tile key={e.name} e={e} onPreview={() => onPreview(e.name)} />
+      ))}
+    </div>
+  );
+}
+
+function Tile({ e, onPreview }: { e: Entry; onPreview: () => void }) {
+  const Icon = e.dir ? Folder : CAT_ICON[catOf(e.name)] || File;
+  const cls = "group relative flex flex-col items-center gap-2 rounded-lg border bg-card p-3 pb-2.5 text-center transition-colors hover:border-ring hover:bg-accent/40 focus-visible:outline-2 focus-visible:outline-ring/70";
+  const inner = (
+    <>
+      <span
+        className={cn(
+          "grid size-12 place-items-center rounded-lg border bg-muted/40",
+          e.dir ? "text-zinc-500" : "text-muted-foreground",
+        )}
+      >
+        <Icon className="size-5" />
+      </span>
+      <span className="w-full truncate text-[12.5px] font-medium" title={e.name}>{e.name}</span>
+      <span className="text-[10.5px] tabular-nums text-muted-foreground">
+        {e.dir ? "folder" : fmtSize(e.size) || "—"}
+      </span>
+      {!e.dir && (
+        <a
+          href={fileUrl(e.name) + "?dl=1"}
+          download={e.name}
+          title={"Download " + e.name}
+          onClick={(ev) => ev.stopPropagation()}
+          className="absolute right-1.5 top-1.5 inline-flex size-7 items-center justify-center rounded-md text-muted-foreground opacity-0 transition-opacity hover:bg-accent hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100"
+        >
+          <Download className="size-3.5" />
+        </a>
+      )}
+    </>
+  );
+  if (e.dir) {
+    return <a href={dirUrl() + seg(e.name) + "/"} className={cls} title={e.name}>{inner}</a>;
+  }
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      onClick={() => onPreview()}
+      onKeyDown={(ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); onPreview(); } }}
+      className={cn(cls, "cursor-pointer")}
+      title={e.name}
+    >
+      {inner}
+    </div>
+  );
+}
+
+/* ---- breadcrumbs ---- */
 
 function Crumbs({ meta }: { meta: { mount: string; dir: string } | null }) {
   if (!meta) return null;
@@ -200,36 +366,7 @@ function Crumbs({ meta }: { meta: { mount: string; dir: string } | null }) {
   return <>{out}</>;
 }
 
-function Row({ e, onPreview }: { e: Entry; onPreview: () => void }) {
-  const Icon = e.dir ? Folder : CAT_ICON[catOf(e.name)] || File;
-  return (
-    <div className="group flex items-center gap-3 py-2">
-      <Icon className={`size-4 shrink-0 ${e.dir ? "text-zinc-500" : "text-muted-foreground"}`} />
-      {e.dir ? (
-        <a href={dirUrl() + seg(e.name) + "/"} className="min-w-0 flex-1 truncate text-[13.5px] hover:underline">
-          {e.name}
-        </a>
-      ) : (
-        <button onClick={onPreview} className="min-w-0 flex-1 truncate text-left text-[13.5px] hover:underline" title={e.name}>
-          {e.name}
-        </button>
-      )}
-      <span className="shrink-0 text-[12px] tabular-nums text-muted-foreground">{e.dir ? "" : fmtSize(e.size)}</span>
-      {!e.dir ? (
-        <a
-          href={fileUrl(e.name) + "?dl=1"}
-          download={e.name}
-          title={"Download " + e.name}
-          className="inline-flex size-8 shrink-0 items-center justify-center rounded-md text-muted-foreground opacity-0 transition-opacity hover:bg-accent hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100"
-        >
-          <Download className="size-4" />
-        </a>
-      ) : (
-        <span className="inline-block size-8 shrink-0" />
-      )}
-    </div>
-  );
-}
+/* ---- preview ---- */
 
 function PreviewDialog({
   file, onClose, onPrev, onNext,

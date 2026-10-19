@@ -7,22 +7,43 @@ Guests get a dead-simple page: browse folders, view photos / PDFs / video / text
 right in the browser, and download anything (or a whole folder as a single
 `.zip`).
 
-The backend is a **Fastify** Node.js server (`server.js`), and the frontend is a
-plain **React** app (`web/`, Vite + Tailwind) that compiles into `public/app/`
-and is served statically — no server-side templating.
-
 ```
-npm start
+npx .          # from this repo
+npx extranet   # once the package is published to the npm registry
 ```
 
 Then open **http://localhost:5050/admin** on the same computer.
 
+## Project layout
+
+```
+bin/cli.js           the launcher — the only thing you run (npx / npm start)
+server/index.js      the Fastify server app: shares, PINs, proxying, ZIP, analytics
+app/                 the Vite + React + Tailwind source (admin, guest, analytics)
+public/app/          the compiled UI that the server serves statically
+data/                runtime data: config.json, logs.json, cloudflared helper
+```
+
+Backend = one self-contained Fastify app in `server/`. Frontend = one Vite app
+in `app/`, built into `public/app/` — no server-side templating. Everything is
+started through `bin/cli.js`, so `npx`, `npm start` and a symlinked global
+install all behave the same. Runtime data lives in `data/` next to the repo;
+for an installed copy it moves to `~/.extranet/data`. `--port <n>` (or the
+`EXTRANET_PORT` env var) overrides the saved port without touching config.
+
+Useful flags: `npx . --port 6060`, `npx . --build` (rebuild the UI), `npx . --help`.
+
 ## What you get
 
+- **Desktop-style UI** — a fixed sidebar + canvas app frame: the console puts
+  the share list front and center with network and internet-link panels in a
+  side rail; analytics is a two-pane view (request log ⇄ clients & blocking);
+  the guest page is a proper file manager with list/grid views, search, and a
+  status bar. All panes scroll inside the frame, with a light/dark toggle.
 - **Real shadcn/ui** — the admin console, the guest page, and analytics are
-  built with actual shadcn/ui components (React + Tailwind + Radix) in `web/`,
+  built with actual shadcn/ui components (React + Tailwind + Radix) in `app/`,
   compiled into `public/app/` and served statically. Bump the design by
-  editing `web/src` and rebuilding.
+  editing `app/src` and rebuilding.
 - **Folder shares** — map any folder to a short web address, e.g.
   `D:\Movies` → `/movies`. Guests open `http://<your-ip>:5050/movies/`.
   Each share can be visible on the Wi-Fi, through the internet link, or both.
@@ -39,10 +60,10 @@ Then open **http://localhost:5050/admin** on the same computer.
 - **Folders you shared are remembered** — after you unshare (or restart), the
   folder stays in the "Recent" chips of the add form and the folder picker, so
   re-sharing is one click, not a re-browse.
-- **Your addresses** — the admin page lists every LAN IP of this computer, and
+- **Your addresses** — the console lists every LAN IP of this computer, and
   every share has a **QR** button (also for the public link while it's running).
   The QR dialog is deliberately small so it never overflows on phones.
-- **Analytics** — a `/analytics` page (same admin protection) with:
+- **Analytics** — an `/analytics` page (same admin protection) with:
   - every guest request to shares: time, IP, method, path, status, bytes,
     share name, blocked flag,
   - aggregated **clients**: how much each IP took, device guess, last seen,
@@ -54,8 +75,8 @@ Then open **http://localhost:5050/admin** on the same computer.
   a random `https://something.trycloudflare.com` address you can send to anyone.
   You don't need a Cloudflare account, and nothing is permanently exposed: the
   link is live only while the tunnel runs, and each run gets a fresh address.
-  If cloudflared isn't installed, the admin page downloads it for you (Windows)
-  or tells you what to install (`brew install cloudflared` / `apt install cloudflared`).
+  If cloudflared isn't installed, the app downloads it for you (Windows) or
+  tells you what to install (`brew install cloudflared` / `apt install cloudflared`).
 - **Receiver page** — minimal list with previews (image, video, audio, PDF,
   text/code), per-file downloads, prev/next between files, a search box, and
   "Download all (.zip)" for the current folder.
@@ -65,22 +86,23 @@ Then open **http://localhost:5050/admin** on the same computer.
 The server serves the prebuilt bundle in `public/app/`. To change the design:
 
 ```
-npm run setup:web   # once — installs React/Vite/Tailwind/shadcn deps
-npm run build:web   # rebuilds public/app from web/src
+npm run setup       # once — installs React/Vite/Tailwind/shadcn deps inside app/
+npm run build       # rebuilds public/app from app/src
 ```
 
-For live-reload UI work: `npm run setup:web`, run `npm start` in the repo root
-(the Fastify server), then `npm run dev` inside `web/` and open the Vite URL —
-API calls are proxied to the Fastify server automatically. To check that all
+For live-reload UI work: `npm run setup`, run `npm start` (the Fastify server),
+then `npm run dev` inside `app/` and open the Vite URL — API calls are proxied
+to the Fastify server automatically. To check that all
 three pages still boot against a running server: `npm run smoke`.
 
 ## Ports
 
-Default: HTTP **5050** (editable in the admin page; the server hops to the next
-free port if it's taken and remembers it). Guest links are plain `http://` —
-the old self-signed HTTPS mode was removed on purpose: guests had to click
-through browser warnings, and the tunnel link already gives proper HTTPS when
-used over the internet.
+Default: HTTP **5050** (editable in the console; the server hops to the next
+free port if it's taken and remembers it. `--port` / `EXTRANET_PORT` override
+it for one run without changing the saved config). Guest links are plain
+`http://` — the old self-signed HTTPS mode was removed on purpose: guests had
+to click through browser warnings, and the tunnel link already gives proper
+HTTPS when used over the internet.
 
 ## Security model
 
@@ -102,11 +124,13 @@ used over the internet.
 ## Files it creates
 
 ```
-web/                 the real shadcn/ui frontend (React + Tailwind)
+bin/                 the npx launcher
+server/index.js      the Fastify server
+app/                 the real shadcn/ui frontend (React + Tailwind)
 public/app/          the compiled UI the server serves
 data/config.json     settings, shares (with their PINs), recent folders, blocked IPs
 data/logs.json       access log for /analytics (last 3000 requests)
-bin/                 cloudflared.exe, if you used "Set up"
+data/bin/            cloudflared, if you used "Set up"
 ```
 
 ## Notes
@@ -127,5 +151,5 @@ bin/                 cloudflared.exe, if you used "Set up"
 
 ## Troubleshooting cloudflared
 
-Start logs are kept in memory; if the tunnel errors, the admin page shows the
+Start logs are kept in memory; if the tunnel errors, the console shows the
 last message under the Internet link section.

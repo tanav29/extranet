@@ -2,17 +2,27 @@
   "name": "extranet",
   "version": "1.0.0",
   "description": "Share folders from this computer over Wi-Fi or the internet, with a dead-simple viewer for guests.",
-  "main": "server.js",
+  "license": "MIT",
+  "main": "server/index.js",
+  "bin": {
+    "extranet": "bin/cli.js"
+  },
+  "files": [
+    "bin/",
+    "server/",
+    "public/",
+    "README.md"
+  ],
   "scripts": {
-    "start": "node server.js",
-    "build:web": "npm --prefix web run build",
-    "setup:web": "npm --prefix web install",
-    "smoke": "node web/smoke.mjs"
+    "start": "node bin/cli.js",
+    "setup": "npm --prefix app install",
+    "dev": "npm --prefix app run dev",
+    "build": "npm --prefix app run build",
+    "smoke": "node app/smoke.mjs"
   },
   "engines": {
     "node": ">=20.17"
   },
-  "license": "MIT",
   "dependencies": {
     "fastify": "^5.12.7",
     "qrcode": "^1.5.4"

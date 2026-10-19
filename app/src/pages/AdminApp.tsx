@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   AlertTriangle, Cable, Copy, Download, ExternalLink, Folder, FolderOpen, Globe,
-  Info, KeyRound, LoaderCircle, Monitor, Pencil, Plus, QrCode, Search, Trash2, Wifi,
+  Info, KeyRound, LoaderCircle, Monitor, Pencil, Plus, QrCode, Search, ShieldBan,
+  Trash2, Wifi,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -13,7 +14,7 @@ import {
   Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle,
 } from "@/components/ui/dialog";
 import {
-  AppShell, Gate, IconBtn, QRDialog, SectionCard, ScopeSwitches,
+  AppShell, Gate, IconBtn, QRDialog, ScopeSwitches, SectionCard, StatusChip,
 } from "@/components/shared";
 import { cn } from "@/lib/utils";
 
@@ -66,7 +67,7 @@ export default function AdminApp() {
 
   if (!loaded || !state) {
     return (
-      <div className="grid min-h-dvh place-items-center text-muted-foreground">
+      <div className="grid min-h-dvh place-items-center bg-muted/30 text-muted-foreground">
         <LoaderCircle className="size-5 animate-spin" />
       </div>
     );
@@ -74,162 +75,62 @@ export default function AdminApp() {
 
   return (
     <AppShell page="admin" host={state.hostname}>
-      <NetworkCard state={state} refresh={refresh} />
-      <TunnelCard state={state} refresh={refresh} onQR={(tunnelUrl) => setQr({ sharePath: "", tunnelUrl })} />
-      <SharesCard state={state} refresh={refresh} onQR={(sharePath, pin) => setQr({ sharePath, pin })} />
-      <TokenNote state={state} />
+      <div className="mx-auto w-full max-w-6xl px-5 py-5 xl:px-8">
+        <PageTop state={state} />
+
+        {/* desktop layout: the share list is the main pane, network + internet
+            link ride along in a side rail; on narrow screens everything stacks */}
+        <div className="grid items-start gap-4 lg:grid-cols-[minmax(0,1fr)_330px]">
+          <SharesCard state={state} refresh={refresh} onQR={(sharePath, pin) => setQr({ sharePath, pin })} />
+          <div className="grid gap-4">
+            <TunnelCard state={state} refresh={refresh} onQR={(tunnelUrl) => setQr({ sharePath: "", tunnelUrl })} />
+            <NetworkCard state={state} refresh={refresh} />
+            <TokenNote state={state} />
+          </div>
+        </div>
+      </div>
       {qr && <QRDialog state={state} sharePath={qr.sharePath} tunnelUrl={qr.tunnelUrl} pin={qr.pin} onClose={() => setQr(null)} />}
     </AppShell>
   );
 }
 
 /* ---------------------------------------------------------------- */
-/* Network card                                                      */
+/* Page top: title + the facts that matter, as quiet chips           */
 /* ---------------------------------------------------------------- */
 
-function NetworkCard({ state, refresh }: { state: State; refresh: () => Promise<any> }) {
-  const [httpPort, setHttpPort] = useState(String(state.ports.http));
-
-  useEffect(() => {
-    setHttpPort(String(state.ports.http));
-  }, [state.ports.http]);
-
-  async function apply() {
-    try {
-      await api("/admin/api/settings", { method: "PATCH", body: { httpPort: parseInt(httpPort, 10) } });
-      toast.success("Settings applied");
-      setTimeout(() => refresh(), 2000);
-    } catch (e: any) { toast.error(e.message); }
-  }
-
-  return (
-    <SectionCard icon={<Wifi />} title="This network">
-      <div>
-        {!state.ips.length && <Empty text="No network detected." />}
-        {(state.ips || []).map((it: any) => (
-          <div key={it.address} className="flex flex-wrap items-center gap-2 border-b px-4 py-2.5 last:border-b-0">
-            <Monitor className="size-4 shrink-0 text-muted-foreground" />
-            <div className="min-w-0 flex-1">
-              <div className="truncate font-mono text-[12.5px]">{it.address}</div>
-              <div className="text-[11.5px] text-muted-foreground">{it.name}</div>
-            </div>
-            <IconBtn title="Copy this address" onClick={() => copyText(it.address).then(() => toast.success("Address copied"))}><Copy /></IconBtn>
-            <IconBtn title="Open in browser" asChild>
-              <a href={`${baseUrl(state, it.address)}/`} target="_blank" rel="noopener"><ExternalLink /></a>
-            </IconBtn>
-          </div>
-        ))}
-      </div>
-      <div className="flex flex-wrap items-center gap-2 border-t px-4 py-3">
-        <span className="text-[11.5px] text-muted-foreground">Port</span>
-        <Input type="number" className="w-20 font-mono text-xs" value={httpPort} onChange={(e) => setHttpPort(e.target.value)} />
-        <div className="flex-1" />
-        <Button size="sm" onClick={apply}>Apply</Button>
-      </div>
-      <Note text="Guests on the same Wi-Fi open these links over plain HTTP — no certificate warnings, no setup." />
-    </SectionCard>
-  );
-}
-
-/* ---------------------------------------------------------------- */
-/* Tunnel card                                                       */
-/* ---------------------------------------------------------------- */
-
-function TunnelCard({ state, refresh, onQR }: { state: State; refresh: () => Promise<any>; onQR: (url: string) => void }) {
+function PageTop({ state }: { state: State }) {
+  const mounts: any[] = state.mounts || [];
   const t = state.tunnel || {};
-  const running = t.status === "running" && t.url;
-
-  async function start() {
-    toast("Starting the internet link…");
-    try {
-      const r = await api("/admin/api/tunnel/start", { method: "POST" });
-      await refresh();
-      if (!r.ok) toast.error(r.error || "Could not start the tunnel");
-      else if (r.url) toast.success("Internet link is live");
-    } catch (e: any) { toast.error(e.message); }
-  }
-
-  async function stop() {
-    try { await api("/admin/api/tunnel/stop", { method: "POST" }); await refresh(); } catch (e: any) { toast.error(e.message); }
-  }
-
-  async function install() {
-    toast("Downloading the Cloudflare helper… (one time)");
-    try {
-      const r = await api("/admin/api/tunnel/install", { method: "POST" });
-      await refresh();
-      if (r.ok) toast.success("Ready — start the link when you need it");
-      else toast.error(r.error || "Install failed");
-    } catch (e: any) { toast.error(e.message); }
-  }
+  const live = t.status === "running" && t.url;
 
   return (
-    <SectionCard
-      icon={<Globe />}
-      title="Internet link"
-      action={
-        <Badge variant={running ? "default" : "secondary"} className="gap-1.5 font-normal">
-          <span className={cn("size-1.5 rounded-full", running ? "bg-primary-foreground" : "bg-muted-foreground/40")} />
-          {running ? "live" : t.status === "starting" ? "connecting" : "off"}
-        </Badge>
-      }
-    >
-      {running && (
-        <div className="flex flex-wrap items-center gap-2 border-b px-4 py-3">
-          <div className="min-w-0 flex-1">
-            <a href={`${t.url}/`} target="_blank" rel="noopener" className="block break-all font-mono text-[12.5px] text-primary underline underline-offset-2">
-              {t.url}/
-            </a>
-            <div className="mt-1 text-[11.5px] text-muted-foreground">Anyone with this link can open shares marked Internet, until you stop it.</div>
-          </div>
-          <IconBtn title="Copy public link" onClick={() => copyText((t.url || "") + "/").then(() => toast.success("Public link copied"))}><Copy /></IconBtn>
-          <IconBtn title="Show QR" onClick={() => onQR(t.url)}><QrCode /></IconBtn>
-          <Button size="sm" variant="destructive" onClick={stop}>Stop</Button>
-        </div>
-      )}
-      {t.status === "starting" && (
-        <div className="flex items-center gap-2 border-b px-4 py-3">
-          <LoaderCircle className="size-4 animate-spin text-muted-foreground" />
-          <span className="flex-1 text-[12.5px] text-muted-foreground">Connecting to Cloudflare…</span>
-          <Button size="sm" variant="outline" onClick={stop}>Cancel</Button>
-        </div>
-      )}
-      {!running && t.status !== "starting" && !t.installed && (
-        <div className="flex flex-wrap items-center gap-2 px-4 py-3">
-          <div className="min-w-0 flex-1">
-            <div className="text-[13px] font-medium">Not set up on this computer</div>
-            <div className="mt-0.5 text-[11.5px] text-muted-foreground">
-              Uses a small Cloudflare helper (about 40 MB, downloaded once). Quick links need no account, and each start gets a fresh address.
-            </div>
-          </div>
-          <Button size="sm" disabled={t.installing} onClick={install}>
-            {t.installing ? <LoaderCircle className="animate-spin" /> : <Download />}
-            {t.installing ? (t.installProgress || "downloading…") : "Set up"}
-          </Button>
-        </div>
-      )}
-      {!running && t.status !== "starting" && t.installed && t.error && (
-        <div className="flex flex-wrap items-center gap-2 px-4 py-3">
-          <AlertTriangle className="size-4 shrink-0 text-amber-600" />
-          <span className="min-w-0 flex-1 text-[12px] text-amber-700">{t.error}</span>
-          <Button size="sm" variant="outline" onClick={start}>Try again</Button>
-        </div>
-      )}
-      {!running && t.status !== "starting" && t.installed && !t.error && (
-        <div className="flex flex-wrap items-center gap-2 px-4 py-3">
-          <div className="min-w-0 flex-1">
-            <div className="text-[13px] font-medium">Share outside your Wi-Fi</div>
-            <div className="mt-0.5 text-[11.5px] text-muted-foreground">Creates a public link for shares marked Internet. Works anywhere, no account needed.</div>
-          </div>
-          <Button size="sm" onClick={start}>Start link</Button>
-        </div>
-      )}
-    </SectionCard>
+    <div className="mb-5 flex flex-wrap items-end gap-x-4 gap-y-3">
+      <div>
+        <h1 className="text-[15.5px] font-semibold tracking-tight">Console</h1>
+        <p className="mt-0.5 text-[12px] text-muted-foreground">Share folders and app ports from this computer.</p>
+      </div>
+      <div className="flex flex-1 flex-wrap items-center justify-end gap-1.5">
+        <StatusChip icon={<FolderOpen />}>
+          {mounts.length} {mounts.length === 1 ? "share" : "shares"}
+        </StatusChip>
+        <StatusChip icon={<Globe />}>
+          {live ? "Internet link live" : t.status === "starting" ? "Link connecting…" : "Internet link off"}
+        </StatusChip>
+        {!!state.blockedCount && (
+          <StatusChip tone="warn" icon={<ShieldBan />}>
+            {state.blockedCount} blocked
+          </StatusChip>
+        )}
+        <StatusChip icon={<Monitor />}>
+          {(state.ips || []).length} network {(state.ips || []).length === 1 ? "address" : "addresses"}
+        </StatusChip>
+      </div>
+    </div>
   );
 }
 
 /* ---------------------------------------------------------------- */
-/* Shares card                                                       */
+/* Shares — the main pane                                            */
 /* ---------------------------------------------------------------- */
 
 function slugOf(dir: string): string {
@@ -291,15 +192,16 @@ function SharesCard({ state, refresh, onQR }: { state: State; refresh: () => Pro
     <SectionCard
       icon={<FolderOpen />}
       title="Shared folders"
-      action={mounts.length ? <span className="text-[11.5px] text-muted-foreground">{mounts.length} shared</span> : undefined}
+      bodyClass="flex flex-col min-h-full"
+      action={mounts.length ? <span className="text-[11.5px] tabular-nums text-muted-foreground">{mounts.length} shared</span> : undefined}
     >
       {!mounts.length && (
-        <div className="flex items-start gap-2.5 border-b px-4 py-3">
+        <div className="flex items-start gap-2.5 border-b px-4 py-4">
           <FolderOpen className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
           <div>
             <div className="text-[13px] font-medium">Nothing shared yet</div>
             <div className="mt-0.5 text-[11.5px] text-muted-foreground">
-              Pick a folder below and press Share — guests get a clean page for browsing and downloading it.
+              Add folder or port shares below — guests get a clean page for browsing and downloading it.
             </div>
           </div>
         </div>
@@ -308,79 +210,80 @@ function SharesCard({ state, refresh, onQR }: { state: State; refresh: () => Pro
         <ShareRow key={m.id} m={m} state={state} refresh={refresh} onQR={onQR} />
       ))}
 
-      <div className="flex flex-col gap-2.5 border-t px-4 py-3">
-        <div className="flex items-center gap-2">
-          <KindPick value={addKind} onChange={setAddKind} />
-          <span className="text-[11.5px] text-muted-foreground">
-            {addKind === "folder"
-              ? "a folder from this computer"
-              : "an app running on this computer"}
+      <div className="mt-auto border-t bg-muted/30 px-4 py-3">
+        <div className="mb-2 flex items-center gap-2 text-[11.5px] font-medium text-muted-foreground">
+          <Plus className="size-3.5" />
+          Add a share
+          <span className="ml-1 font-normal">
+            {addKind === "folder" ? "— a folder from this computer" : "— an app running on this computer"}
           </span>
         </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <Input
-            className="w-36 font-mono text-xs"
-            placeholder="/web-address"
-            value={addPath}
-            onChange={(e) => { setAddPath(e.target.value); setNameTouched(true); }}
-          />
-          {addKind === "folder" ? (
+
+        <div className="grid gap-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <KindPick value={addKind} onChange={setAddKind} />
             <Input
-              className="min-w-40 flex-1 font-mono text-xs"
-              placeholder="folder on this computer"
-              value={addDir}
-              onChange={(e) => setDir(e.target.value)}
-            />
-          ) : (
-            <Input
-              type="number"
               className="w-36 font-mono text-xs"
-              placeholder="port (e.g. 3000)"
-              min={1024}
-              max={65535}
-              value={addPort}
-              onChange={(e) => setAddPort(e.target.value)}
+              placeholder="/web-address"
+              value={addPath}
+              onChange={(e) => { setAddPath(e.target.value); setNameTouched(true); }}
             />
-          )}
-          {addKind === "folder" && (
-            <Button size="sm" variant="outline" onClick={() => setPickerOpen(true)}><Search />Browse</Button>
-          )}
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <Input
-            className="w-44 font-mono text-xs"
-            placeholder="PIN · 6 digits · optional"
-            inputMode="numeric"
-            maxLength={6}
-            value={addPin}
-            title="Guests enter this PIN once; their browser remembers it"
-            onChange={(e) => setAddPin(e.target.value.replace(/[^\d]/g, ""))}
-          />
-          <ScopeSwitches lan={lan} pub={pub} onLan={setLan} onPub={setPub} />
-          <span className="text-[11.5px] text-muted-foreground">who can reach it</span>
-          {recents.length > 0 && (
-            <div className="ml-auto flex max-w-full flex-wrap items-center gap-1.5">
-              <span className="text-[11px] text-muted-foreground">Recent:</span>
-              {recents.slice(0, 4).map((d) => (
-                <button
-                  key={d}
-                  title={d}
-                  onClick={() => setDir(d)}
-                  className="max-w-44 truncate rounded-md border bg-secondary px-2 py-1 font-mono text-[11px] text-secondary-foreground hover:bg-secondary/70"
-                >
-                  {d.split(/[\\/]/).filter(Boolean).pop() || d}
-                </button>
-              ))}
-            </div>
-          )}
-        </div>
-        <div className="flex items-center justify-between gap-2">
-          <div className="min-w-0 text-[11.5px] text-muted-foreground">
+            {addKind === "folder" ? (
+              <>
+                <Input
+                  className="min-w-40 flex-1 font-mono text-xs"
+                  placeholder="folder on this computer"
+                  value={addDir}
+                  onChange={(e) => setDir(e.target.value)}
+                />
+                <Button size="sm" variant="outline" onClick={() => setPickerOpen(true)}><Search />Browse</Button>
+              </>
+            ) : (
+              <Input
+                type="number"
+                className="w-36 font-mono text-xs"
+                placeholder="port (e.g. 3000)"
+                min={1024}
+                max={65535}
+                value={addPort}
+                onChange={(e) => setAddPort(e.target.value)}
+              />
+            )}
+          </div>
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+            <Input
+              className="w-44 font-mono text-xs"
+              placeholder="PIN · 6 digits · optional"
+              inputMode="numeric"
+              maxLength={6}
+              value={addPin}
+              title="Guests enter this PIN once; their browser remembers it"
+              onChange={(e) => setAddPin(e.target.value.replace(/[^\d]/g, ""))}
+            />
+            <ScopeSwitches lan={lan} pub={pub} onLan={setLan} onPub={setPub} />
+            {recents.length > 0 && (
+              <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+                <span className="text-[11px] text-muted-foreground">Recent:</span>
+                {recents.slice(0, 4).map((d) => (
+                  <button
+                    key={d}
+                    title={d}
+                    onClick={() => setDir(d)}
+                    className="max-w-44 truncate rounded-md border bg-card px-2 py-1 font-mono text-[11px] text-secondary-foreground hover:bg-accent"
+                  >
+                    {d.split(/[\\/]/).filter(Boolean).pop() || d}
+                  </button>
+                ))}
+              </div>
+            )}
+            <div className="flex-1" />
+            <Button size="sm" disabled={busy} onClick={add}><Plus />Share</Button>
+          </div>
+          <p className="text-[11px] leading-relaxed text-muted-foreground">
             {addKind === "port"
               ? "Every request under the address is forwarded to that port on this computer (plain HTTP, no websockets)."
               : "The web address is the path guests see, like /photos. Keep it short and simple."}
-          </div>
-          <Button size="sm" disabled={busy} onClick={add}><Plus />Share</Button>
+          </p>
         </div>
       </div>
 
@@ -455,11 +358,13 @@ function ShareRow({ m, state, refresh, onQR }: { m: any; state: State; refresh: 
   }
 
   return (
-    <div className="flex flex-wrap items-center gap-2 border-b px-4 py-2.5 last:border-b-0">
-      <Folder className="size-4 shrink-0 text-zinc-500" />
-      <div className="min-w-0 flex-1">
+    <div className="group flex flex-wrap items-center gap-x-3 gap-y-1.5 border-b px-4 py-2.5 transition-colors last:border-b-0 hover:bg-muted/40">
+      <span className="grid size-8 shrink-0 place-items-center rounded-md border bg-muted/50 text-muted-foreground">
+        {m.kind === "port" ? <Cable className="size-4" /> : <Folder className="size-4 text-zinc-500" />}
+      </span>
+      <div className="min-w-40 flex-1">
         <div className="flex items-center gap-1.5">
-          <span className="truncate font-mono text-[12.5px]">{m.path}/</span>
+          <a href={shareUrl()} target="_blank" rel="noopener" className="truncate font-mono text-[12.5px] hover:underline">{m.path}/</a>
           {m.kind === "port" ? (
             <Badge variant="secondary" className="gap-1 font-normal"><Cable className="size-3" />:{m.port}</Badge>
           ) : null}
@@ -467,10 +372,12 @@ function ShareRow({ m, state, refresh, onQR }: { m: any; state: State; refresh: 
             <Badge variant="secondary" className="gap-1 font-normal"><KeyRound className="size-3" />PIN</Badge>
           ) : null}
         </div>
-        <div className="truncate font-mono text-[11px] text-muted-foreground" title={m.dir}>{m.kind === "port" ? `→ 127.0.0.1:${m.port}` : m.dir}</div>
+        <div className="truncate font-mono text-[11px] text-muted-foreground" title={m.kind === "port" ? `127.0.0.1:${m.port}` : m.dir}>
+          {m.kind === "port" ? `→ 127.0.0.1:${m.port}` : m.dir}
+        </div>
       </div>
       <ScopeSwitches lan={lan} pub={pub} onLan={(v) => patch({ lan: v })} onPub={(v) => patch({ public: v })} />
-      <div className="flex items-center">
+      <div className="flex items-center opacity-60 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
         <IconBtn title="Copy link (includes the PIN when set)" onClick={() => copyText(shareUrl()).then(() => toast.success("Link copied"))}><Copy /></IconBtn>
         <IconBtn title="Show QR" onClick={() => onQR(m.path, m.pin)}><QrCode /></IconBtn>
         <IconBtn title="Edit address, port and PIN" onClick={() => setEditOpen(true)}><Pencil /></IconBtn>
@@ -579,8 +486,6 @@ function ShareEditDialog({
   );
 }
 
-const FORMATTED_MONTHS = "6 months";
-
 /* ---------------------------------------------------------------- */
 /* Folder picker dialog                                              */
 /* ---------------------------------------------------------------- */
@@ -662,16 +567,159 @@ function FolderPickerDialog({
 }
 
 /* ---------------------------------------------------------------- */
+/* Right rail — internet link                                         */
+/* ---------------------------------------------------------------- */
+
+function TunnelCard({ state, refresh, onQR }: { state: State; refresh: () => Promise<any>; onQR: (url: string) => void }) {
+  const t = state.tunnel || {};
+  const running = t.status === "running" && t.url;
+
+  async function start() {
+    toast("Starting the internet link…");
+    try {
+      const r = await api("/admin/api/tunnel/start", { method: "POST" });
+      await refresh();
+      if (!r.ok) toast.error(r.error || "Could not start the tunnel");
+      else if (r.url) toast.success("Internet link is live");
+    } catch (e: any) { toast.error(e.message); }
+  }
+
+  async function stop() {
+    try { await api("/admin/api/tunnel/stop", { method: "POST" }); await refresh(); } catch (e: any) { toast.error(e.message); }
+  }
+
+  async function install() {
+    toast("Downloading the Cloudflare helper… (one time)");
+    try {
+      const r = await api("/admin/api/tunnel/install", { method: "POST" });
+      await refresh();
+      if (r.ok) toast.success("Ready — start the link when you need it");
+      else toast.error(r.error || "Install failed");
+    } catch (e: any) { toast.error(e.message); }
+  }
+
+  return (
+    <SectionCard
+      icon={<Globe />}
+      title="Internet link"
+      action={
+        <Badge variant={running ? "default" : "secondary"} className="gap-1.5 font-normal">
+          <span className={cn("size-1.5 rounded-full", running ? "bg-primary-foreground" : "bg-muted-foreground/40")} />
+          {running ? "live" : t.status === "starting" ? "connecting" : "off"}
+        </Badge>
+      }
+    >
+      {running && (
+        <div className="flex flex-wrap items-center gap-2 border-b px-4 py-3">
+          <div className="min-w-0 flex-1">
+            <a href={`${t.url}/`} target="_blank" rel="noopener" className="block break-all font-mono text-[12px] text-primary underline underline-offset-2">
+              {t.url}/
+            </a>
+            <div className="mt-1 text-[11.5px] text-muted-foreground">Anyone with this link can open internet-marked shares, until you stop it.</div>
+          </div>
+          <IconBtn title="Copy public link" onClick={() => copyText((t.url || "") + "/").then(() => toast.success("Public link copied"))}><Copy /></IconBtn>
+          <IconBtn title="Show QR" onClick={() => onQR(t.url)}><QrCode /></IconBtn>
+          <Button size="sm" variant="destructive" onClick={stop}>Stop</Button>
+        </div>
+      )}
+      {t.status === "starting" && (
+        <div className="flex items-center gap-2 border-b px-4 py-3">
+          <LoaderCircle className="size-4 animate-spin text-muted-foreground" />
+          <span className="flex-1 text-[12.5px] text-muted-foreground">Connecting to Cloudflare…</span>
+          <Button size="sm" variant="outline" onClick={stop}>Cancel</Button>
+        </div>
+      )}
+      {!running && t.status !== "starting" && !t.installed && (
+        <div className="flex flex-wrap items-center gap-2 px-4 py-3">
+          <div className="min-w-0 flex-1">
+            <div className="text-[13px] font-medium">Not set up on this computer</div>
+            <div className="mt-0.5 text-[11.5px] text-muted-foreground">
+              Downloads a small Cloudflare helper (once). Quick links need no account.
+            </div>
+          </div>
+          <Button size="sm" disabled={t.installing} onClick={install}>
+            {t.installing ? <LoaderCircle className="animate-spin" /> : <Download />}
+            {t.installing ? (t.installProgress || "downloading…") : "Set up"}
+          </Button>
+        </div>
+      )}
+      {!running && t.status !== "starting" && t.installed && t.error && (
+        <div className="flex flex-wrap items-center gap-2 px-4 py-3">
+          <AlertTriangle className="size-4 shrink-0 text-amber-600" />
+          <span className="min-w-0 flex-1 text-[12px] text-amber-700">{t.error}</span>
+          <Button size="sm" variant="outline" onClick={start}>Try again</Button>
+        </div>
+      )}
+      {!running && t.status !== "starting" && t.installed && !t.error && (
+        <div className="px-4 py-3">
+          <div className="mb-2 text-[11.5px] text-muted-foreground">Creates a fresh public link for internet-marked shares. Works anywhere, no account needed.</div>
+          <Button size="sm" onClick={start}>Start link</Button>
+        </div>
+      )}
+    </SectionCard>
+  );
+}
+
+/* ---------------------------------------------------------------- */
+/* Right rail — this network                                         */
+/* ---------------------------------------------------------------- */
+
+function NetworkCard({ state, refresh }: { state: State; refresh: () => Promise<any> }) {
+  const [httpPort, setHttpPort] = useState(String(state.ports.http));
+
+  useEffect(() => {
+    setHttpPort(String(state.ports.http));
+  }, [state.ports.http]);
+
+  async function apply() {
+    try {
+      await api("/admin/api/settings", { method: "PATCH", body: { httpPort: parseInt(httpPort, 10) } });
+      toast.success("Settings applied");
+      setTimeout(() => refresh(), 2000);
+    } catch (e: any) { toast.error(e.message); }
+  }
+
+  return (
+    <SectionCard icon={<Wifi />} title="This network">
+      <div>
+        {!state.ips.length && <Empty text="No network detected." />}
+        {(state.ips || []).map((it: any) => (
+          <div key={it.address} className="group flex flex-wrap items-center gap-2 border-b px-4 py-2 last:border-b-0">
+            <div className="min-w-0 flex-1">
+              <div className="truncate font-mono text-[12px]">{it.address}</div>
+              <div className="text-[10.5px] text-muted-foreground">{it.name}</div>
+            </div>
+            <div className="flex items-center opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
+              <IconBtn title="Copy this address" onClick={() => copyText(it.address).then(() => toast.success("Address copied"))}><Copy /></IconBtn>
+              <IconBtn title="Open in browser" asChild>
+                <a href={`${baseUrl(state, it.address)}/`} target="_blank" rel="noopener"><ExternalLink /></a>
+              </IconBtn>
+            </div>
+          </div>
+        ))}
+      </div>
+      <div className="flex flex-wrap items-center gap-2 border-t px-4 py-2.5">
+        <span className="text-[11.5px] text-muted-foreground">Port</span>
+        <Input type="number" className="w-20 font-mono text-xs" value={httpPort} onChange={(e) => setHttpPort(e.target.value)} />
+        <div className="flex-1" />
+        <Button size="sm" variant="outline" onClick={apply}>Apply</Button>
+      </div>
+      <Note text="Guests on the same Wi-Fi open these links over plain HTTP — no certificate warnings, no setup." />
+    </SectionCard>
+  );
+}
+
+/* ---------------------------------------------------------------- */
 /* Bits                                                              */
 /* ---------------------------------------------------------------- */
 
 function TokenNote({ state }: { state: State }) {
   if (!state.token) return null;
   return (
-    <div className="flex items-center justify-center gap-2 pt-1 text-center text-[12px] text-muted-foreground">
-      <KeyRound className="size-3.5" />
-      <span>
-        Admin token <code className="rounded bg-muted px-1 font-mono text-[11px]">{state.token}</code> — needed when managing from another device
+    <div className="flex items-start gap-2 rounded-xl border bg-card px-4 py-2.5 shadow-sm">
+      <KeyRound className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" />
+      <span className="text-[11.5px] leading-relaxed text-muted-foreground">
+        Admin token <code className="rounded bg-muted px-1 font-mono text-[11px] text-foreground">{state.token}</code> — needed when managing from another device.
       </span>
       <IconBtn title="Copy token" onClick={() => copyText(state.token).then(() => toast.success("Token copied"))}><Copy /></IconBtn>
     </div>
