@@ -89,12 +89,10 @@ export function primaryIP(state: any): string | null {
   return (state.ips && state.ips[0] && state.ips[0].address) || null;
 }
 
-export function baseUrl(state: any, ip: string | null, secure: boolean): string {
-  const httpsOk = secure && state.ports.https;
-  const port = httpsOk ? state.ports.https : state.ports.http;
-  const proto = httpsOk ? "https" : "http";
-  if (!ip) return `http://localhost:${state.ports.http}`;
-  return `${proto}://${ip}:${port}`;
+export function baseUrl(state: any, ip: string | null): string {
+  const port = (state?.ports?.http) || 5050;
+  if (!ip) return `http://localhost:${port}`;
+  return `http://${ip}:${port}`;
 }
 
 export function copyText(text: string): Promise<void> {

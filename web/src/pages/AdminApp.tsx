@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
-  AlertTriangle, Copy, Download, ExternalLink, Folder, FolderOpen, Globe,
-  Info, KeyRound, LoaderCircle, Monitor, Plus, QrCode, Search, Trash2, Wifi,
+  AlertTriangle, Cable, Copy, Download, ExternalLink, Folder, FolderOpen, Globe,
+  Info, KeyRound, LoaderCircle, Monitor, Pencil, Plus, QrCode, Search, Trash2, Wifi,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -9,7 +9,6 @@ import { api, baseUrl, copyText, primaryIP } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
-import { Switch } from "@/components/ui/switch";
 import {
   Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle,
 } from "@/components/ui/dialog";
@@ -19,13 +18,14 @@ import {
 import { cn } from "@/lib/utils";
 
 type State = any;
+type MountKind = "folder" | "port";
 
 export default function AdminApp() {
   const [state, setState] = useState<State | null>(null);
   const [needToken, setNeedToken] = useState(false);
   const [loaded, setLoaded] = useState(false);
 
-  const [qr, setQr] = useState<{ sharePath: string; tunnelUrl?: string | null } | null>(null);
+  const [qr, setQr] = useState<{ sharePath: string; tunnelUrl?: string | null; pin?: string | null } | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -76,9 +76,9 @@ export default function AdminApp() {
     <AppShell page="admin" host={state.hostname}>
       <NetworkCard state={state} refresh={refresh} />
       <TunnelCard state={state} refresh={refresh} onQR={(tunnelUrl) => setQr({ sharePath: "", tunnelUrl })} />
-      <SharesCard state={state} refresh={refresh} onQR={(sharePath) => setQr({ sharePath })} />
+      <SharesCard state={state} refresh={refresh} onQR={(sharePath, pin) => setQr({ sharePath, pin })} />
       <TokenNote state={state} />
-      {qr && <QRDialog state={state} sharePath={qr.sharePath} tunnelUrl={qr.tunnelUrl} onClose={() => setQr(null)} />}
+      {qr && <QRDialog state={state} sharePath={qr.sharePath} tunnelUrl={qr.tunnelUrl} pin={qr.pin} onClose={() => setQr(null)} />}
     </AppShell>
   );
 }
@@ -89,21 +89,15 @@ export default function AdminApp() {
 
 function NetworkCard({ state, refresh }: { state: State; refresh: () => Promise<any> }) {
   const [httpPort, setHttpPort] = useState(String(state.ports.http));
-  const [httpsPort, setHttpsPort] = useState(String(state.ports.https || state.configuredHttpsPort || ""));
-  const [httpsOn, setHttpsOn] = useState(!!state.ports.https);
 
   useEffect(() => {
     setHttpPort(String(state.ports.http));
-    setHttpsPort(String(state.ports.https || state.configuredHttpsPort || ""));
-    setHttpsOn(!!state.ports.https);
-  }, [state.ports.http, state.ports.https, state.configuredHttpsPort]);
+  }, [state.ports.http]);
 
   async function apply() {
     try {
-      const body: any = { httpPort: parseInt(httpPort, 10), httpsEnabled: httpsOn };
-      if (httpsOn) body.httpsPort = parseInt(httpsPort, 10);
-      const r = await api("/admin/api/settings", { method: "PATCH", body });
-      toast.success(r.tunnelRestarted ? "Applied — internet link restarting" : "Settings applied");
+      await api("/admin/api/settings", { method: "PATCH", body: { httpPort: parseInt(httpPort, 10) } });
+      toast.success("Settings applied");
       setTimeout(() => refresh(), 2000);
     } catch (e: any) { toast.error(e.message); }
   }
@@ -120,30 +114,19 @@ function NetworkCard({ state, refresh }: { state: State; refresh: () => Promise<
               <div className="text-[11.5px] text-muted-foreground">{it.name}</div>
             </div>
             <IconBtn title="Copy this address" onClick={() => copyText(it.address).then(() => toast.success("Address copied"))}><Copy /></IconBtn>
-            <IconBtn title="Open HTTPS" asChild>
-              <a href={`${baseUrl(state, it.address, true)}/`} target="_blank" rel="noopener"><ExternalLink /></a>
+            <IconBtn title="Open in browser" asChild>
+              <a href={`${baseUrl(state, it.address)}/`} target="_blank" rel="noopener"><ExternalLink /></a>
             </IconBtn>
           </div>
         ))}
       </div>
       <div className="flex flex-wrap items-center gap-2 border-t px-4 py-3">
-        <span className="text-[11.5px] text-muted-foreground">Ports</span>
+        <span className="text-[11.5px] text-muted-foreground">Port</span>
         <Input type="number" className="w-20 font-mono text-xs" value={httpPort} onChange={(e) => setHttpPort(e.target.value)} />
-        <Input type="number" className="w-20 font-mono text-xs" value={httpsPort} disabled={!httpsOn} onChange={(e) => setHttpsPort(e.target.value)} />
-        <label className="flex items-center gap-1.5 text-[11.5px] font-medium text-muted-foreground" title="Self-signed certificate; devices show a warning the first time">
-          <Switch checked={httpsOn} onCheckedChange={(v) => setHttpsOn(v)} />
-          HTTPS
-        </label>
         <div className="flex-1" />
         <Button size="sm" onClick={apply}>Apply</Button>
       </div>
-      <Note text="Guests on the same Wi-Fi open these links. HTTPS uses a self-signed certificate, so the first visit shows a warning — choose “proceed / visit website”." />
-      {state.httpsError && (
-        <div className="flex items-start gap-2 border-t px-4 py-2.5 text-[12px] text-amber-700">
-          <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
-          <span>HTTPS problem: {state.httpsError} — HTTP still works.</span>
-        </div>
-      )}
+      <Note text="Guests on the same Wi-Fi open these links over plain HTTP — no certificate warnings, no setup." />
     </SectionCard>
   );
 }
@@ -254,13 +237,17 @@ function slugOf(dir: string): string {
   return "/" + base.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
 }
 
-function SharesCard({ state, refresh, onQR }: { state: State; refresh: () => Promise<any>; onQR: (sharePath: string) => void }) {
+function SharesCard({ state, refresh, onQR }: { state: State; refresh: () => Promise<any>; onQR: (sharePath: string, pin?: string | null) => void }) {
+  const [addKind, setAddKind] = useState<MountKind>("folder");
   const [addPath, setAddPath] = useState("");
   const [addDir, setAddDir] = useState("");
+  const [addPort, setAddPort] = useState("");
+  const [addPin, setAddPin] = useState("");
   const [nameTouched, setNameTouched] = useState(false);
   const [lan, setLan] = useState(true);
   const [pub, setPub] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
 
   const recents: string[] = state.recentDirs || [];
   const mounts = state.mounts || [];
@@ -272,14 +259,32 @@ function SharesCard({ state, refresh, onQR }: { state: State; refresh: () => Pro
   }
 
   async function add() {
-    if (!addPath.trim() || !addDir.trim()) { toast.error("Pick a folder and a web address first"); return; }
+    if (!addPath.trim()) { toast.error("Pick a web address first"); return; }
+    if (addKind === "folder" && !addDir.trim()) { toast.error("Pick a folder first"); return; }
+    if (addKind === "port" && addPort.trim() === "") { toast.error("Which port should this address forward to?"); return; }
+    setBusy(true);
     try {
-      const body = { path: addPath, dir: addDir, lan, public: pub };
+      const body: any = {
+        kind: addKind,
+        path: addPath,
+        lan,
+        public: pub,
+      };
+      if (addKind === "folder") body.dir = addDir;
+      if (addKind === "port") body.port = parseInt(addPort, 10);
+      if (addPin.trim()) body.pin = addPin.replace(/[^\d]/g, "");
       await api("/admin/api/mounts", { method: "POST", body });
-      setAddDir(""); setAddPath(""); setNameTouched(false);
+      setAddDir(""); setAddPath(""); setAddPort(""); setAddPin("");
+      setNameTouched(false);
       await refresh();
-      toast.success(`Shared at ${slugOf(addPath) || addPath}`);
-    } catch (e: any) { toast.error(e.message); }
+      toast.success(addKind === "port"
+        ? `Shared ${addPath} — forwards to port ${addPort}`
+        : `Shared at ${addPath}`);
+    } catch (e: any) {
+      toast.error(e.message);
+    } finally {
+      setBusy(false);
+    }
   }
 
   return (
@@ -304,6 +309,14 @@ function SharesCard({ state, refresh, onQR }: { state: State; refresh: () => Pro
       ))}
 
       <div className="flex flex-col gap-2.5 border-t px-4 py-3">
+        <div className="flex items-center gap-2">
+          <KindPick value={addKind} onChange={setAddKind} />
+          <span className="text-[11.5px] text-muted-foreground">
+            {addKind === "folder"
+              ? "a folder from this computer"
+              : "an app running on this computer"}
+          </span>
+        </div>
         <div className="flex flex-wrap items-center gap-2">
           <Input
             className="w-36 font-mono text-xs"
@@ -311,17 +324,40 @@ function SharesCard({ state, refresh, onQR }: { state: State; refresh: () => Pro
             value={addPath}
             onChange={(e) => { setAddPath(e.target.value); setNameTouched(true); }}
           />
-          <Input
-            className="min-w-40 flex-1 font-mono text-xs"
-            placeholder="folder on this computer"
-            value={addDir}
-            onChange={(e) => setDir(e.target.value)}
-          />
-          <Button size="sm" variant="outline" onClick={() => setPickerOpen(true)}><Search />Browse</Button>
+          {addKind === "folder" ? (
+            <Input
+              className="min-w-40 flex-1 font-mono text-xs"
+              placeholder="folder on this computer"
+              value={addDir}
+              onChange={(e) => setDir(e.target.value)}
+            />
+          ) : (
+            <Input
+              type="number"
+              className="w-36 font-mono text-xs"
+              placeholder="port (e.g. 3000)"
+              min={1024}
+              max={65535}
+              value={addPort}
+              onChange={(e) => setAddPort(e.target.value)}
+            />
+          )}
+          {addKind === "folder" && (
+            <Button size="sm" variant="outline" onClick={() => setPickerOpen(true)}><Search />Browse</Button>
+          )}
         </div>
-        <div className="flex flex-wrap items-center gap-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <Input
+            className="w-44 font-mono text-xs"
+            placeholder="PIN · 6 digits · optional"
+            inputMode="numeric"
+            maxLength={6}
+            value={addPin}
+            title="Guests enter this PIN once; their browser remembers it"
+            onChange={(e) => setAddPin(e.target.value.replace(/[^\d]/g, ""))}
+          />
           <ScopeSwitches lan={lan} pub={pub} onLan={setLan} onPub={setPub} />
-          <span className="text-[11.5px] text-muted-foreground">— pick who can reach this share</span>
+          <span className="text-[11.5px] text-muted-foreground">who can reach it</span>
           {recents.length > 0 && (
             <div className="ml-auto flex max-w-full flex-wrap items-center gap-1.5">
               <span className="text-[11px] text-muted-foreground">Recent:</span>
@@ -338,12 +374,14 @@ function SharesCard({ state, refresh, onQR }: { state: State; refresh: () => Pro
             </div>
           )}
         </div>
-        <div className="flex justify-end">
-          <Button size="sm" onClick={add}><Plus />Share</Button>
+        <div className="flex items-center justify-between gap-2">
+          <div className="min-w-0 text-[11.5px] text-muted-foreground">
+            {addKind === "port"
+              ? "Every request under the address is forwarded to that port on this computer (plain HTTP, no websockets)."
+              : "The web address is the path guests see, like /photos. Keep it short and simple."}
+          </div>
+          <Button size="sm" disabled={busy} onClick={add}><Plus />Share</Button>
         </div>
-        <NoteInline>
-          The web address is the path guests see, like <code className="font-mono">/photos</code>. Keep it short and simple.
-        </NoteInline>
       </div>
 
       <FolderPickerDialog
@@ -356,9 +394,36 @@ function SharesCard({ state, refresh, onQR }: { state: State; refresh: () => Pro
   );
 }
 
-function ShareRow({ m, state, refresh, onQR }: { m: any; state: State; refresh: () => Promise<any>; onQR: (p: string) => void }) {
+/* ---------------------------------------------------------------- */
+/* Share kind picker                                                  */
+/* ---------------------------------------------------------------- */
+
+function KindPick({ value, onChange }: { value: MountKind; onChange: (v: MountKind) => void }) {
+  const opt = (k: MountKind, icon: React.ReactNode, label: string) => (
+    <button
+      type="button"
+      onClick={() => onChange(k)}
+      className={cn(
+        "inline-flex items-center gap-1.5 rounded px-2.5 py-1 text-[11.5px] font-medium transition-colors",
+        value === k ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground",
+      )}
+    >
+      {icon}
+      {label}
+    </button>
+  );
+  return (
+    <div className="flex items-center rounded-md border p-0.5">
+      {opt("folder", <Folder className="size-3.5" />, "Folder")}
+      {opt("port", <Cable className="size-3.5" />, "App port")}
+    </div>
+  );
+}
+
+function ShareRow({ m, state, refresh, onQR }: { m: any; state: State; refresh: () => Promise<any>; onQR: (p: string, pin?: string | null) => void }) {
   const [lan, setLan] = useState(!!m.lan);
   const [pub, setPub] = useState(!!m.public);
+  const [editOpen, setEditOpen] = useState(false);
 
   useEffect(() => { setLan(!!m.lan); setPub(!!m.public); }, [m.lan, m.public]);
 
@@ -367,6 +432,7 @@ function ShareRow({ m, state, refresh, onQR }: { m: any; state: State; refresh: 
     if (next.public !== undefined) setPub(next.public);
     try {
       await api(`/admin/api/mounts/${m.id}`, { method: "PATCH", body: { ...m, ...next } });
+      await refresh();
     } catch (e: any) {
       toast.error(e.message);
       setLan(!!m.lan); setPub(!!m.public);
@@ -384,29 +450,136 @@ function ShareRow({ m, state, refresh, onQR }: { m: any; state: State; refresh: 
 
   function shareUrl(): string {
     const t = state?.tunnel || {};
-    if (t.status === "running" && t.url && m.public) return t.url + m.path + "/";
-    return baseUrl(state, primaryIP(state), true) + m.path + "/";
+    const base = t.status === "running" && t.url && m.public ? t.url : baseUrl(state, primaryIP(state));
+    return base + m.path + "/" + (m.pin ? `?pin=${encodeURIComponent(m.pin)}` : "");
   }
 
   return (
     <div className="flex flex-wrap items-center gap-2 border-b px-4 py-2.5 last:border-b-0">
       <Folder className="size-4 shrink-0 text-zinc-500" />
       <div className="min-w-0 flex-1">
-        <div className="truncate font-mono text-[12.5px]">{m.path}/</div>
-        <div className="truncate font-mono text-[11px] text-muted-foreground" title={m.dir}>{m.dir}</div>
+        <div className="flex items-center gap-1.5">
+          <span className="truncate font-mono text-[12.5px]">{m.path}/</span>
+          {m.kind === "port" ? (
+            <Badge variant="secondary" className="gap-1 font-normal"><Cable className="size-3" />:{m.port}</Badge>
+          ) : null}
+          {m.pin ? (
+            <Badge variant="secondary" className="gap-1 font-normal"><KeyRound className="size-3" />PIN</Badge>
+          ) : null}
+        </div>
+        <div className="truncate font-mono text-[11px] text-muted-foreground" title={m.dir}>{m.kind === "port" ? `→ 127.0.0.1:${m.port}` : m.dir}</div>
       </div>
       <ScopeSwitches lan={lan} pub={pub} onLan={(v) => patch({ lan: v })} onPub={(v) => patch({ public: v })} />
       <div className="flex items-center">
-        <IconBtn title="Copy link" onClick={() => copyText(shareUrl()).then(() => toast.success("Link copied"))}><Copy /></IconBtn>
-        <IconBtn title="Show QR" onClick={() => onQR(m.path)}><QrCode /></IconBtn>
+        <IconBtn title="Copy link (includes the PIN when set)" onClick={() => copyText(shareUrl()).then(() => toast.success("Link copied"))}><Copy /></IconBtn>
+        <IconBtn title="Show QR" onClick={() => onQR(m.path, m.pin)}><QrCode /></IconBtn>
+        <IconBtn title="Edit address, port and PIN" onClick={() => setEditOpen(true)}><Pencil /></IconBtn>
         <IconBtn title="Open in browser" asChild>
           <a href={shareUrl()} target="_blank" rel="noopener"><ExternalLink /></a>
         </IconBtn>
         <IconBtn title="Stop sharing" destructive onClick={del}><Trash2 /></IconBtn>
       </div>
+      <ShareEditDialog
+        open={editOpen}
+        onOpenChange={setEditOpen}
+        m={m}
+        onDone={refresh}
+      />
     </div>
   );
 }
+
+/* ---------------------------------------------------------------- */
+/* Share edit dialog (address, port, PIN)                             */
+/* ---------------------------------------------------------------- */
+
+function ShareEditDialog({
+  open, onOpenChange, m, onDone,
+}: { open: boolean; onOpenChange: (o: boolean) => void; m: any; onDone: () => Promise<any> }) {
+  const [path, setPath] = useState(m.path);
+  const [port, setPort] = useState(String(m.port || ""));
+  const [pin, setPin] = useState(m.pin || "");
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    if (!open) return;
+    setPath(m.path);
+    setPort(String(m.port || ""));
+    setPin(m.pin || "");
+  }, [open, m]);
+
+  async function save() {
+    setBusy(true);
+    try {
+      const body: any = { path, pin };
+      if (m.kind === "port") body.port = parseInt(port, 10);
+      else body.dir = m.dir;
+      await api(`/admin/api/mounts/${m.id}`, { method: "PATCH", body });
+      onOpenChange(false);
+      await onDone();
+      const cleared = !!m.pin && !pin;
+      toast.success(cleared ? "PIN removed" : m.pin === pin ? "Share updated" : "PIN updated");
+    } catch (e: any) {
+      toast.error(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-sm">
+        <DialogHeader>
+          <DialogTitle>Edit share</DialogTitle>
+          <DialogDescription>
+            {m.kind === "port"
+              ? "Forwards everything under this address to a local port on this computer."
+              : "The address guests open, and the PIN they must enter once."}
+          </DialogDescription>
+        </DialogHeader>
+        <div className="grid gap-2.5">
+          <label className="grid gap-1 text-[11.5px] font-medium text-muted-foreground">
+            Web address
+            <Input className="font-mono text-xs" placeholder="/photos" value={path} onChange={(e) => setPath(e.target.value)} />
+          </label>
+          {m.kind === "port" && (
+            <label className="grid gap-1 text-[11.5px] font-medium text-muted-foreground">
+              Port on this computer
+              <Input
+                type="number" min={1024} max={65535}
+                className="font-mono text-xs" value={port} onChange={(e) => setPort(e.target.value)}
+              />
+            </label>
+          )}
+          <label className="grid gap-1 text-[11.5px] font-medium text-muted-foreground">
+            6-digit PIN
+            <div className="flex items-center gap-2">
+              <Input
+                inputMode="numeric" maxLength={6}
+                className="font-mono text-xs" placeholder="blank = no PIN"
+                value={pin} onChange={(e) => setPin(e.target.value.replace(/[^\d]/g, ""))}
+              />
+              {m.pin && (
+                <Button size="sm" variant="outline" type="button" disabled={busy} onClick={() => setPin("")}>
+                  Remove
+                </Button>
+              )}
+            </div>
+          </label>
+          <p className="text-[11px] leading-relaxed text-muted-foreground">
+            Guests type the PIN once — their browser then remembers it for 6 months. Share links copied here include the PIN automatically.
+          </p>
+          <div className="flex justify-end gap-2 pt-1">
+            <Button size="sm" variant="outline" onClick={() => onOpenChange(false)}>Cancel</Button>
+            <Button size="sm" disabled={busy} onClick={save}>Save</Button>
+          </div>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+const FORMATTED_MONTHS = "6 months";
 
 /* ---------------------------------------------------------------- */
 /* Folder picker dialog                                              */
@@ -510,15 +683,6 @@ function Note({ text }: { text: string }) {
     <div className="flex items-start gap-2 border-t px-4 py-2.5 text-[11.5px] leading-relaxed text-muted-foreground">
       <Info className="mt-0.5 size-3.5 shrink-0" />
       <span>{text}</span>
-    </div>
-  );
-}
-
-function NoteInline({ children }: { children: React.ReactNode }) {
-  return (
-    <div className="flex items-start gap-2 text-[11.5px] leading-relaxed text-muted-foreground">
-      <Info className="mt-0.5 size-3.5 shrink-0" />
-      <span>{children}</span>
     </div>
   );
 }

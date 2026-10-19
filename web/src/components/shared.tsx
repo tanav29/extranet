@@ -126,26 +126,27 @@ export function SectionCard({
 /* ---------------------------------------------------------------- */
 
 export function QRDialog({
-  state, sharePath, tunnelUrl, onClose,
+  state, sharePath, tunnelUrl, pin, onClose,
 }: {
   state: any;
   sharePath: string;
   tunnelUrl?: string | null;
+  pin?: string | null;
   onClose: () => void;
 }) {
   const targets = useMemo(() => {
     const list: { label: string; url: string }[] = [];
     for (const it of state.ips || []) {
-      if (state.ports.https) list.push({ label: `${it.address}:${state.ports.https} (https) — ${it.name}`, url: baseUrl(state, it.address, true) });
-      list.push({ label: `${it.address}:${state.ports.http} (http) — ${it.name}`, url: baseUrl(state, it.address, false) });
+      list.push({ label: `${it.address}:${state.ports.http} — ${it.name}`, url: baseUrl(state, it.address) });
     }
-    if (!list.length) list.push({ label: `localhost:${state.ports.http}`, url: baseUrl(state, null, false) });
+    if (!list.length) list.push({ label: `localhost:${state.ports.http}`, url: baseUrl(state, null) });
     return list;
   }, [state]);
 
   const [conn, setConn] = useState<string>(() => tunnelUrl || targets[0]?.url || "");
 
-  const url = conn + (sharePath || "").replace(/\/+$/, "") + "/";
+  const pinSuffix = pin ? `?pin=${encodeURIComponent(pin)}` : "";
+  const url = conn + (sharePath || "").replace(/\/+$/, "") + "/" + pinSuffix;
   const src = `/admin/qr?u=${encodeURIComponent(url)}&t=${encodeURIComponent(getToken())}`;
 
   return (
@@ -179,6 +180,11 @@ export function QRDialog({
         </Select>
 
         <p className="break-all text-center font-mono text-[11px] text-muted-foreground">{url}</p>
+        {pin && (
+          <p className="text-center text-[11px] text-muted-foreground">
+            This link carries its <span className="font-medium text-foreground">PIN once</span> — guests won't need to type it.
+          </p>
+        )}
 
         <Button variant="outline" className="w-full" onClick={() => copyText(url).then(() => toast.success("Link copied"))}>
           <Copy /> Copy link

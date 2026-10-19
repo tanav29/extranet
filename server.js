@@ -2,17 +2,20 @@
 /*
  * Extranet — share folders from this computer.
  *
- *  - Fastify Node.js server (two instances: HTTP + self-signed HTTPS)
+ *  - Fastify Node.js server (plain HTTP — the self-signed HTTPS mode was removed)
  *  - Serves each configured folder ("share") under a URL path, e.g. /photos
+ *  - Can also expose a port of this computer under a URL path (/webapp → 127.0.0.1:3000)
+ *  - Shares can be locked with a 6-digit PIN; guests enter it once (cookie) or pass it in the URL (?pin=123456)
  *  - The React app in web/ compiles into public/app and is served statically:
  *    admin console (/admin), guest browser (any share path), analytics (/analytics)
- *  - LAN over HTTPS (self-signed) and HTTP, plus a Cloudflare quick-tunnel for internet access
+ *  - LAN over HTTP, plus a Cloudflare quick-tunnel for internet access
  *  - Admin console at /admin (this machine only, or with a token)
  *
- * Small dependencies: fastify, qrcode, selfsigned.
+ * Small dependencies: fastify, qrcode.
  */
 'use strict';
 
+const http = require('http');
 const https = require('https'); // used only for the cloudflared download
 const fs = require('fs');
 const fsp = fs.promises;
@@ -26,8 +29,6 @@ const Fastify = require('fastify');
 const ROOT = __dirname;
 const PUBLIC_DIR = path.join(ROOT, 'public');
 const DATA_DIR = path.join(ROOT, 'data');
-const CERT_FILE = path.join(DATA_DIR, 'certs', 'cert.pem');
-const KEY_FILE = path.join(DATA_DIR, 'certs', 'key.pem');
 const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
 const BIN_DIR = path.join(ROOT, 'bin');
 
@@ -35,8 +36,6 @@ const TUNNEL_HOST_RE = /\.trycloudflare\.com$/i;
 
 let QRCode = null;
 try { QRCode = require('qrcode'); } catch { /* optional: served without QR */ }
-let selfsigned = null;
-try { selfsigned = require('selfsigned'); } catch { /* optional: http only */ }
 
 /* ------------------------------------------------------------------ */
 /* Config                                                              */
@@ -45,10 +44,8 @@ try { selfsigned = require('selfsigned'); } catch { /* optional: http only */ }
 function defaultConfig() {
   return {
     httpPort: 5050,
-    httpsPort: 5443,
-    httpsEnabled: true,
     adminToken: crypto.randomBytes(6).toString('hex'),
-    mounts: [], // { id, path: "/name", dir, lan: bool, public: bool }
+    mounts: [], // { id, kind: "folder"|"port", path: "/name", dir?, port?, pin?, lan: bool, public: bool }
     recentDirs: [], // folders ever shared, so re-adding is one click
     blockedIPs: [], // { ip, ts, note? } — rejected for guest traffic
   };
@@ -58,10 +55,20 @@ let config = defaultConfig();
 try {
   const loaded = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
   config = { ...defaultConfig(), ...loaded };
+  delete config.httpsPort;          // the HTTPS mode is gone — ignore leftovers
+  delete config.httpsEnabled;
   if (!Array.isArray(config.mounts)) config.mounts = [];
   for (const m of config.mounts) {
+    m.kind = m.kind === 'port' ? 'port' : 'folder';
     m.lan = m.lan !== false;
     m.public = m.public === true;
+    if (m.kind === 'port') {
+      const p = Number(m.port);
+      if (!Number.isInteger(p) || p < 1 || p > 65535) m.port = null;
+    } else {
+      delete m.port;
+    }
+    m.pin = /^\d{6}$/.test(String(m.pin || '')) ? String(m.pin) : null;
   }
   if (!Array.isArray(config.recentDirs)) config.recentDirs = [];
   if (!Array.isArray(config.blockedIPs)) config.blockedIPs = [];
@@ -139,10 +146,135 @@ function timingSafeToken(got, want) {
   return crypto.timingSafeEqual(a, b);
 }
 
+/* keep PIN entries out of the access log & analytics */
+function obscurePinnedPath(u) {
+  return String(u).replace(/(pin=)\d{6}/g, '$1\u2022\u2022\u2022\u2022\u2022\u2022');
+}
+
+/* request bodies arrive as raw buffers (or '' when empty) — parse client JSON out */
+function parseBody(req) {
+  const b = req.body;
+  if (b == null) return {};
+  if (Buffer.isBuffer(b)) return b.length ? JSON.parse(b.toString('utf8')) : {};
+  return JSON.parse(String(b));
+}
+
 function pushRecentDir(dir) {
   const d = String(dir || '').trim();
   if (!d) return;
   config.recentDirs = [d, ...config.recentDirs.filter((x) => String(x).toLowerCase() !== d.toLowerCase())].slice(0, 10);
+}
+
+/* ------------------------------------------------------------------ */
+/* Share PIN gate (6 digits, remembered once per device via cookie)    */
+/* ------------------------------------------------------------------ */
+
+const PIN_COOKIE_PREFIX = 'xpin-';
+const PIN_COOKIE_MAX_AGE = 60 * 60 * 24 * 180; // 180 days — enter the PIN once per device
+
+function pinCookieKey(id) {
+  return PIN_COOKIE_PREFIX + String(id).replace(/[^a-zA-Z0-9-]/g, '');
+}
+
+function pinCookieValue(mount) {
+  return crypto.createHash('sha256').update(`${mount.id}|${mount.pin}|${config.adminToken}`).digest('hex');
+}
+
+function pinCookieFromRequest(req, mount) {
+  const raw = String((req.headers.cookie || ''));
+  for (const pair of raw.split(';')) {
+    const i = pair.indexOf('=');
+    if (i < 0) continue;
+    if (pair.slice(0, i).trim() === pinCookieKey(mount.id)) return pair.slice(i + 1).trim();
+  }
+  return null;
+}
+
+function setPinCookie(reply, mount) {
+  reply.header('Set-Cookie', `${pinCookieKey(mount.id)}=${pinCookieValue(mount)}; Path=/; Max-Age=${PIN_COOKIE_MAX_AGE}; HttpOnly; SameSite=Lax`);
+}
+
+/*
+ * Brute-force throttle, per IP + share: 30 wrong entries inside 10 minutes
+ * cools down that IP for 15 minutes. In-memory only; localhost is never throttled.
+ */
+const PINS_WINDOW = 10 * 60 * 1000;
+const PINS_LIMIT = 30;
+const PINS_COOLDOWN = 15 * 60 * 1000;
+const pinFailures = new Map(); // key "ip|mountId" -> { n, first, until }
+
+function pinThrottled(ip, mountId) {
+  const e = pinFailures.get(`${ip}|${mountId}`);
+  return !!(e && e.until > Date.now());
+}
+
+function pinNoteFailure(ip, mountId) {
+  const key = `${ip}|${mountId}`;
+  const now = Date.now();
+  let e = pinFailures.get(key);
+  if (!e || now - e.first > PINS_WINDOW) e = { n: 0, first: now, until: 0 };
+  e.n += 1;
+  e.first = now;
+  if (e.n >= PINS_LIMIT) { e.until = now + PINS_COOLDOWN; e.n = 0; }
+  pinFailures.set(key, e);
+  if (pinFailures.size > 2000) {
+    for (const [k, v] of pinFailures) {
+      if (!(v.until > now) && now - v.first > PINS_WINDOW) pinFailures.delete(k);
+    }
+  }
+}
+
+function pinClearFailure(ip, mountId) {
+  pinFailures.delete(`${ip}|${mountId}`);
+}
+
+function pinGatePage(reply, mountPath, opts) {
+  const { wrong = false, cooldown = false } = opts || {};
+  const msg = cooldown
+    ? 'Too many wrong attempts. Wait a bit and try again.'
+    : wrong
+      ? 'That PIN isn\u2019t right — try again.'
+      : 'Enter the 6-digit PIN the owner gave you.';
+  return html(reply, wrong || cooldown ? 403 : 401, 'Locked', `
+<h1>\u{1F512} This share is locked</h1>
+<p>${escapeHTML(msg)}</p>
+<form method="GET" action="${escapeHTML(mountPath)}" style="display:flex;gap:8px;justify-content:center;margin-top:10px">
+  <input name="pin" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" autofocus
+    placeholder="\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}" required
+    style="font:18px/1.5 ui-monospace,SFMono-Regular,monospace;letter-spacing:6px;text-align:center;width:11em;padding:8px 10px;border:1px solid #d4d4d8;border-radius:8px">
+  <button style="font:600 14px system-ui,sans-serif;padding:8px 16px;border:0;border-radius:8px;background:#1c1e21;color:#fff;cursor:pointer">Open</button>
+</form>`);
+}
+
+/**
+ * Returns true when access may continue, false when a gate response was sent.
+ * Fills `req.__pinJustOk` so hijacked routes (zip / proxy / files) can still
+ * attach the Set-Cookie header before FLUSHING the raw response.
+ */
+function enforceSharePin(req, reply, mount, url) {
+  if (!mount.pin || req.ctx.local) return true;
+
+  if (pinCookieValue(mount) === pinCookieFromRequest(req.raw, mount)) return true;
+
+  if (pinThrottled(req.ctx.ip, mount.id)) {
+    pinGatePage(reply, url.pathname, { cooldown: true });
+    return false;
+  }
+
+  const entered = (url.searchParams.get('pin') || '').trim();
+  if (entered && timingSafeToken(entered, mount.pin)) {
+    pinClearFailure(req.ctx.ip, mount.id);
+    setPinCookie(reply, mount);
+    // drop the PIN from the visible URL (HTTP 303 forces a GET)
+    const search = new URLSearchParams(url.searchParams);
+    search.delete('pin');
+    const q = search.toString();
+    return reply.code(303).header('Location', url.pathname + (q ? `?${q}` : '')).send();
+  }
+
+  if (entered) pinNoteFailure(req.ctx.ip, mount.id);
+  pinGatePage(reply, url.pathname, { wrong: !!entered });
+  return false;
 }
 
 /* ------------------------------------------------------------------ */
@@ -452,27 +584,6 @@ async function sendZip(res, rootDir, zipName) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Certificate (self-signed HTTPS)                                     */
-/* ------------------------------------------------------------------ */
-
-function ensureCertificate() {
-  if (!selfsigned) throw new Error('the "selfsigned" package is not installed (run: npm install)');
-  fs.mkdirSync(path.dirname(CERT_FILE), { recursive: true });
-  if (fs.existsSync(CERT_FILE) && fs.existsSync(KEY_FILE)) return { key: fs.readFileSync(KEY_FILE), cert: fs.readFileSync(CERT_FILE) };
-  const alt = [{ type: 2, value: 'localhost' }, { type: 7, ip: '127.0.0.1' }, { type: 2, value: os.hostname() }];
-  for (const { address } of lanIPs()) alt.push({ type: 7, ip: address });
-  const pems = selfsigned.generate([{ name: 'commonName', value: os.hostname() }], {
-    days: 825,
-    keySize: 2048,
-    algorithm: 'sha256',
-    extensions: [{ name: 'subjectAltName', altNames: alt }],
-  });
-  fs.writeFileSync(KEY_FILE, pems.private);
-  fs.writeFileSync(CERT_FILE, pems.cert);
-  return { key: fs.readFileSync(KEY_FILE), cert: fs.readFileSync(CERT_FILE) };
-}
-
-/* ------------------------------------------------------------------ */
 /* Cloudflare quick tunnel                                             */
 /* ------------------------------------------------------------------ */
 
@@ -657,24 +768,24 @@ function blockedPage(reply, ip) {
 }
 
 /*
- * Build one protocol's app. Called once for HTTP and (independently) for HTTPS,
- * so settings changes can close and rebuild instances.
+ * Build the app. Called again when settings change, so the listener can be
+ * closed and rebuilt with the new values.
  */
-function buildApp(httpsCreds) {
+function buildApp() {
   const app = Fastify({
-    ...(httpsCreds ? { https: httpsCreds } : {}),
     logger: false,
     bodyLimit: 2 * 1024 * 1024, // same cap as the previous readBody()
   });
 
   /*
-   * Parse every request body as plain text; the admin endpoints JSON.parse it
-   * themselves (like the old readBody() did), so bad JSON keeps producing the
-   * same friendly "bad json" errors instead of Fastify's stricter ones.
+   * Keep every request body around as the raw buffer — the admin endpoints
+   * parse JSON out of it themselves (same friendly "bad json" errors as
+   * before), and port-share proxying needs the exact bytes, not utf8-mangled
+   * text.
    */
-  const rawBodyParser = (_req, body, done) => done(null, body == null ? '' : String(body));
-  app.addContentTypeParser('application/json', { parseAs: 'string' }, rawBodyParser);
-  app.addContentTypeParser('*', { parseAs: 'string' }, rawBodyParser);
+  const rawBodyParser = (_req, body, done) => done(null, body == null ? '' : body);
+  app.addContentTypeParser('application/json', { parseAs: 'buffer' }, rawBodyParser);
+  app.addContentTypeParser('*', { parseAs: 'buffer' }, rawBodyParser);
   app.decorateRequest('ctx', null);
   app.decorateRequest('__ev', null);
 
@@ -705,8 +816,11 @@ async function onRequestSetup(req, reply) {
 
   if (rawUrl.startsWith('//')) return json(reply, 400, { error: 'bad url' });
 
-  const local = isLocalSocket(raw.socket);
+  const sock = raw.socket;
+  // "local" means the owner's own computer — but traffic from the cloudflared
+  // process also arrives on localhost, so tunnel guests must not count.
   const isTunnel = TUNNEL_HOST_RE.test(String(raw.headers.host || '').toLowerCase());
+  const local = !isTunnel && isLocalSocket(sock);
   const ip = requestIP(raw, isTunnel);
   const kind = isTunnel ? 'tunnel' : local ? 'local' : 'lan';
   req.ctx = { isTunnel, local, ip, kind };
@@ -720,7 +834,7 @@ async function onRequestSetup(req, reply) {
   // access log entry — filled in when the response finishes
   tapResponse(reply.raw);
   const ev = {
-    t: Date.now(), ip, method, path: rawUrl,
+    t: Date.now(), ip, method, path: obscurePinnedPath(rawUrl),
     status: 0, bytes: 0, ua: String(raw.headers['user-agent'] || '').slice(0, 160),
     share: null, kind, blocked: false,
   };
@@ -840,6 +954,26 @@ function normUrlPath(input) {
   return '/' + segs.join('/');
 }
 
+/* returns null when fine, or { error } for the admin API */
+function normPortNumber(v, _label) {
+  const n = Number(v);
+  if (v === undefined || v === null || String(v).trim() === '' || !Number.isInteger(n) || n < 1024 || n > 65535) {
+    return { error: 'the port number must be between 1024 and 65535' };
+  }
+  return null;
+}
+
+/* body.pin: 6 digits to set, "" to clear; returns an error string or null */
+function applyPin(mount, value) {
+  if (value === undefined) return null;
+  const s = String(value ?? '').trim();
+  if (!s) { mount.pin = null; return null; }
+  const digits = s.replace(/[^\d]/g, '');
+  if (!/^\d{6}$/.test(digits)) return 'the PIN must be exactly 6 digits';
+  mount.pin = digits;
+  return null;
+}
+
 const RESERVED_PREFIXES = ['/admin', '/analytics', '/app', '/favicon.ico', '/robots.txt', '/fonts'];
 
 function isReserved(p) {
@@ -901,7 +1035,7 @@ async function adminRoute(req, reply) {
 
   if (method === 'POST' && api === 'api/block') {
     let body;
-    try { body = JSON.parse(req.body || '{}'); } catch { return json(reply, 400, { error: 'bad json' }); }
+    try { body = parseBody(req); } catch { return json(reply, 400, { error: 'bad json' }); }
     const ip = normIP(body.ip);
     if (!ip || ip === '?' || ip.length > 64) return json(reply, 400, { error: 'bad ip' });
     if (ip === '127.0.0.1' || ip === '::1') return json(reply, 400, { error: "won't block this computer itself" });
@@ -936,23 +1070,36 @@ async function adminRoute(req, reply) {
 
   if (method === 'POST' && api === 'api/mounts') {
     let body;
-    try { body = JSON.parse(req.body || '{}'); } catch { return json(reply, 400, { error: 'bad json' }); }
+    try { body = parseBody(req); } catch { return json(reply, 400, { error: 'bad json' }); }
     const p = normUrlPath(body.path);
     if (!p) return json(reply, 400, { error: 'web address must look like /photos (lowercase letters, numbers, - . _)' });
     if (isReserved(p)) return json(reply, 400, { error: `the address ${p} is reserved` });
     if (config.mounts.some((m) => m.path === p)) return json(reply, 400, { error: `the address ${p} is already used` });
-    const dir = String(body.dir || '').trim();
-    const st = await fsp.stat(path.resolve(dir)).catch(() => null);
-    if (!st || !st.isDirectory()) return json(reply, 400, { error: `no folder found at ${dir}` });
+    const kind = body.kind === 'port' ? 'port' : 'folder';
     const mount = {
       id: crypto.randomUUID(),
+      kind,
       path: p,
-      dir: path.resolve(dir),
       lan: body.lan !== false,
       public: body.public === true,
     };
+    if (kind === 'port') {
+      const err = normPortNumber(body.port, 'port');
+      if (err) return json(reply, 400, { error: err.error });
+      if (Number(body.port) === servers.httpPort) {
+        return json(reply, 400, { error: "that's the port Extranet itself runs on — it would loop forever" });
+      }
+      mount.port = Number(body.port);
+    } else {
+      const dir = String(body.dir || '').trim();
+      const st = await fsp.stat(path.resolve(dir)).catch(() => null);
+      if (!st || !st.isDirectory()) return json(reply, 400, { error: `no folder found at ${dir}` });
+      mount.dir = path.resolve(dir);
+    }
+    const pinErr = applyPin(mount, body.pin);
+    if (pinErr) return json(reply, 400, { error: pinErr });
     config.mounts.push(mount);
-    pushRecentDir(mount.dir);
+    if (mount.dir) pushRecentDir(mount.dir);
     saveConfig();
     return json(reply, 200, { ok: true, mount: publicMount(mount) });
   }
@@ -963,7 +1110,7 @@ async function adminRoute(req, reply) {
 
   if (method === 'PATCH' && mount) {
     let body;
-    try { body = JSON.parse(req.body || '{}'); } catch { return json(reply, 400, { error: 'bad json' }); }
+    try { body = parseBody(req); } catch { return json(reply, 400, { error: 'bad json' }); }
     if (body.path !== undefined) {
       const p = normUrlPath(body.path);
       if (!p) return json(reply, 400, { error: 'bad address' });
@@ -976,6 +1123,30 @@ async function adminRoute(req, reply) {
       if (!st || !st.isDirectory()) return json(reply, 400, { error: 'no such folder' });
       mount.dir = path.resolve(body.dir);
       pushRecentDir(mount.dir);
+    }
+    if (body.kind !== undefined && (body.kind === 'port' || body.kind === 'folder') && body.kind !== mount.kind) {
+      if (body.kind === 'port') {
+        const err = normPortNumber(body.port !== undefined ? body.port : mount.port, 'port');
+        if (err) return json(reply, 400, { error: err.error });
+        mount.port = Number(body.port !== undefined ? body.port : mount.port);
+      } else {
+        const st = await fsp.stat(path.resolve(body.dir || '')).catch(() => null);
+        if (!st || !st.isDirectory()) return json(reply, 400, { error: 'to switch to a folder share, pick the folder too' });
+        mount.dir = path.resolve(body.dir);
+      }
+      mount.kind = body.kind;
+    }
+    if (body.port !== undefined && mount.kind === 'port') {
+      const err = normPortNumber(body.port, 'port');
+      if (err) return json(reply, 400, { error: err.error });
+      if (Number(body.port) === servers.httpPort) {
+        return json(reply, 400, { error: "that's the port Extranet itself runs on — it would loop forever" });
+      }
+      mount.port = Number(body.port);
+    }
+    if (body.pin !== undefined) {
+      const pinErr = applyPin(mount, body.pin);
+      if (pinErr) return json(reply, 400, { error: pinErr });
     }
     if (body.lan !== undefined) mount.lan = body.lan === true;
     if (body.public !== undefined) mount.public = body.public === true;
@@ -991,20 +1162,14 @@ async function adminRoute(req, reply) {
 
   if (method === 'PATCH' && api === 'api/settings') {
     let body;
-    try { body = JSON.parse(req.body || '{}'); } catch { return json(reply, 200, { ok: false, error: 'bad json' }); }
+    try { body = parseBody(req); } catch { return json(reply, 200, { ok: false, error: 'bad json' }); }
     try {
       // validate + persist first, answer, then restart listeners in the background
-      if (body.httpPort !== undefined || body.httpsPort !== undefined) {
-        const hnum = Number(body.httpPort !== undefined ? body.httpPort : config.httpPort);
-        const snum = Number(body.httpsPort !== undefined ? body.httpsPort : config.httpsPort);
-        for (const [label, p] of [['HTTP', hnum], ['HTTPS', snum]]) {
-          if (!Number.isInteger(p) || p < 1024 || p > 65535) throw new Error(`${label} port must be 1024–65535`);
-        }
-        if (snum === hnum) throw new Error('HTTP and HTTPS ports must differ');
+      if (body.httpPort !== undefined) {
+        const hnum = Number(body.httpPort);
+        if (!Number.isInteger(hnum) || hnum < 1024 || hnum > 65535) throw new Error('HTTP port must be 1024–65535');
+        config.httpPort = hnum;
       }
-      if (body.httpsEnabled !== undefined) config.httpsEnabled = body.httpsEnabled === true;
-      if (body.httpPort !== undefined) config.httpPort = Number(body.httpPort);
-      if (body.httpsPort !== undefined) config.httpsPort = Number(body.httpsPort);
       saveConfig();
       const tunnelWasRunning = !!tunnel.proc;
       if (tunnelWasRunning) stopTunnel();
@@ -1030,7 +1195,16 @@ async function adminRoute(req, reply) {
 }
 
 function publicMount(m) {
-  return { id: m.id, path: m.path, dir: m.dir, lan: m.lan !== false, public: m.public === true };
+  return {
+    id: m.id,
+    kind: m.kind || 'folder',
+    path: m.path,
+    dir: m.dir,
+    port: m.port,
+    pin: m.pin,
+    lan: m.lan !== false,
+    public: m.public === true,
+  };
 }
 
 function tunnelState() {
@@ -1051,9 +1225,7 @@ function buildState(ctx) {
     platform: process.platform,
     home: os.homedir(),
     ips: lanIPs(),
-    ports: { http: servers.httpPort, https: servers.https && !servers.httpsError ? servers.httpsPort : null },
-    configuredHttpsPort: config.httpsPort,
-    httpsError: servers.httpsError,
+    ports: { http: servers.httpPort },
     qrAvailable: !!QRCode,
     mounts: config.mounts.map(publicMount),
     tunnel: tunnelState(),
@@ -1133,6 +1305,13 @@ async function serveShare(req, reply) {
     return notFoundPage(reply, 'Nothing is shared under this address.');
   }
 
+  // 6-digit PIN check (once per device — a cookie remembers it; the owner's
+  // own computer never needs it). Sends the gate page or a redirect and stops.
+  if (!enforceSharePin(req, reply, mount, url)) return;
+
+  // port share: everything under the address goes to a local app instead of a folder
+  if (mount.kind === 'port') return proxyPort(req, reply, mount, url);
+
   // compute absolute path within the mount
   const relSegs = segs.slice(mount.path.split('/').length - 1);
   let abs = mount.dir;
@@ -1159,6 +1338,119 @@ async function serveShare(req, reply) {
   }
   if (st.isFile()) return serveFile(req, reply, absReal, st, { download: url.searchParams.get('dl') === '1' });
   return notFoundPage(reply, 'This item is not a viewable file or folder.');
+}
+
+/* ------------------------------------------------------------------ */
+/* Port shares — expose a local port under the share's URL path        */
+/* ------------------------------------------------------------------ */
+
+const HOP_SKIP_REQ = new Set([
+  'connection', 'keep-alive', 'proxy-connection', 'transfer-encoding', 'upgrade',
+  'te', 'trailer', 'expect', 'host',
+]);
+const HOP_SKIP_RES = new Set([
+  'connection', 'keep-alive', 'proxy-connection', 'transfer-encoding', 'upgrade',
+  'te', 'trailer',
+]);
+const NOT_BODY_METHODS = new Set(['GET', 'HEAD', 'OPTIONS', 'TRACE', 'CONNECT']);
+
+function proxyTargetPath(url, mount) {
+  let rest = '/';
+  if (url.pathname.startsWith(mount.path + '/')) rest = url.pathname.slice(mount.path.length);
+  else if (url.pathname === mount.path) rest = '/';
+  const search = new URLSearchParams(url.searchParams);
+  search.delete('pin');
+  const q = search.toString();
+  return rest + (q ? `?${q}` : '');
+}
+
+function proxyPort(req, reply, mount, url) {
+  const raw = req.raw;
+  const res = reply.raw;
+  reply.hijack();
+
+  if (String(raw.headers.upgrade || '').toLowerCase() === 'websocket') {
+    res.writeHead(501, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+    return res.end(pageHTML('WebSockets not supported', `<h1>WebSockets not supported</h1>
+<p>The share <code>${escapeHTML(mount.path)}</code> forwards regular HTTP only. Live/websocket features of the app behind it won't work here.</p>`));
+  }
+
+  if (raw.method === 'OPTIONS') {
+    // same-origin for the guest: no CORS escapes needed
+    res.writeHead(204, { 'Cache-Control': 'no-store' });
+    return res.end();
+  }
+
+  const headers = {};
+  for (const [k, v] of Object.entries(raw.headers)) {
+    if (!HOP_SKIP_REQ.has(k.toLowerCase())) headers[k] = v;
+  }
+  headers.host = `127.0.0.1:${mount.port}`;
+  headers['x-forwarded-host'] = String(raw.headers.host || '');
+  headers['x-forwarded-prefix'] = mount.path;
+  headers['x-forwarded-proto'] = 'http';
+  headers['x-forwarded-for'] = req.ctx.ip || '?';
+
+  (async () => {
+    try {
+      // request body: Fastify holds the exact bytes — forward them untouched
+      let buf = null;
+      if (!NOT_BODY_METHODS.has((raw.method || 'GET').toUpperCase())) {
+        if (req.body != null) buf = Buffer.isBuffer(req.body) ? req.body : Buffer.from(String(req.body));
+        else {
+          const chunks = [];
+          for await (const c of raw) chunks.push(c);
+          buf = Buffer.concat(chunks);
+        }
+        delete headers['transfer-encoding'];
+        headers['content-length'] = String(buf.length);
+      }
+
+      const up = http.request({
+        host: '127.0.0.1',
+        port: mount.port,
+        path: proxyTargetPath(url, mount),
+        method: raw.method,
+        headers,
+        agent: false, // one fresh upstream connection per visitor request
+      }, (uRes) => {
+        // the visitor may be gone by now — never fight a closed socket
+        if (res.writableEnded || res.destroyed || res.socket == null) { uRes.destroy(); return; }
+        try {
+          const flat = [];
+          const hs = uRes.rawHeaders;
+          for (let i = 0; i < hs.length; i += 2) {
+            const name = hs[i].toLowerCase();
+            if (HOP_SKIP_RES.has(name)) continue;
+            let value = hs[i + 1];
+            if (name === 'location' && String(value).startsWith('/')) value = mount.path + value;
+            flat.push(name, value);
+          }
+          res.writeHead(uRes.statusCode || 502, flat);
+          res.on('error', () => uRes.destroy());
+          uRes.pipe(res);
+        } catch {
+          try { uRes.destroy(); } catch { /* ignore */ }
+          try { res.destroy(); } catch { /* ignore */ }
+        }
+      });
+      up.on('error', () => {
+        if (res.headersSent || res.destroyed) { try { res.destroy(); } catch { /* ignore */ } return; }
+        res.writeHead(502, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+        res.end(pageHTML('App unavailable', `<h1>Can't reach the app</h1>
+<p>The share <code>${escapeHTML(mount.path)}</code> forwards to port ${mount.port} on this computer, but nothing is answering there right now.
+The app may be stopped — ask the owner to start it, then refresh.</p>`));
+      });
+      raw.on('error', () => { try { up.destroy(); } catch { /* ignore */ } });
+      if (buf === null) up.end();
+      else up.end(buf);
+    } catch (err) {
+      if (!res.headersSent) {
+        res.writeHead(502, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      }
+      try { res.end(); } catch { /* ignore */ }
+    }
+  })();
 }
 
 async function serveDirectory(req, reply, url, mount, urlPath, absDir, st) {
@@ -1261,10 +1553,7 @@ function serveFile(req, reply, absFile, st, opts) {
 
 const servers = {
   http: null,
-  https: null,
   httpPort: config.httpPort,
-  httpsPort: config.httpsPort,
-  httpsError: null,
 };
 
 function isAddrInUse(err) {
@@ -1299,28 +1588,10 @@ async function closeServer(app) {
 
 async function startServers() {
   await closeServer(servers.http);
-  await closeServer(servers.https);
-  servers.httpsError = null;
-
-  const httpRes = await listenWithBump(() => buildApp(null), config.httpPort);
+  const httpRes = await listenWithBump(() => buildApp(), config.httpPort);
   servers.http = httpRes.app;
   servers.httpPort = httpRes.port;
   if (config.httpPort !== httpRes.port) config.httpPort = httpRes.port;
-
-  if (config.httpsEnabled) {
-    try {
-      const creds = ensureCertificate();
-      const httpsRes = await listenWithBump(() => buildApp(creds), config.httpsPort);
-      servers.https = httpsRes.app;
-      servers.httpsPort = httpsRes.port;
-      if (config.httpsPort !== httpsRes.port) config.httpsPort = httpsRes.port;
-    } catch (err) {
-      servers.https = null;
-      servers.httpsError = err.message;
-    }
-  } else {
-    servers.https = null;
-  }
   saveConfig();
 }
 
@@ -1339,13 +1610,13 @@ async function boot() {
   lines.push(`  Admin (this computer)     http://localhost:${servers.httpPort}/admin`);
   lines.push(`  Analytics (this computer) http://localhost:${servers.httpPort}/analytics  — logs, client IPs, blocking`);
   if (primary) {
-    if (servers.https && !servers.httpsError) lines.push(`  On this Wi-Fi (HTTPS)     https://${primary}:${servers.httpsPort}/<share>`);
-    lines.push(`  On this Wi-Fi (HTTP)      http://${primary}:${servers.httpPort}/<share>`);
+    lines.push(`  On this Wi-Fi             http://${primary}:${servers.httpPort}/<share>`);
   } else {
     lines.push('  (no LAN IP found — Wi-Fi sharing unavailable)');
   }
   lines.push('  Share folders by opening the admin page and adding them.');
-  if (servers.httpsError) lines.push(`  HTTPS problem: ${servers.httpsError}`);
+  lines.push('  Shares can ask guests for a 6-digit PIN once, and can also expose an app');
+  lines.push(`  that runs on this computer (a local port) under the same addresses.`);
   lines.push(`  Admin token (only needed to manage from another device): ${config.adminToken}`);
   lines.push('  Tip: if Windows asks about the firewall, allow Node.js on private networks.');
   console.log(lines.join('\n'));
