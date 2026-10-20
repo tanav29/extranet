@@ -5,6 +5,7 @@
  *  - Fastify Node.js server (plain HTTP — the self-signed HTTPS mode was removed)
  *  - Serves each configured folder ("share") under a URL path, e.g. /photos
  *  - Can also expose a port of this computer under a URL path (/webapp → 127.0.0.1:3000)
+ *  - Or redirect guests straight to a shared link (/docs → https://example.com/doc)
  *  - Shares can be locked with a 6-digit PIN; guests enter it once (cookie) or pass it in the URL (?pin=123456)
  *  - The React app in app/ compiles into public/app and is served statically:
  *    admin console (/admin), guest browser (any share path), analytics (/analytics),
@@ -59,13 +60,39 @@ function defaultConfig() {
   return {
     httpPort: 5050,
     adminToken: crypto.randomBytes(6).toString('hex'),
-    mounts: [], // { id, kind: "folder"|"port", path: "/name", dir?, port?, pin?, lan: bool, public: bool }
+    mounts: [], // { id, kind: "folder"|"port"|"url", path: "/name", dir?, port?, url?, pin?, lan: bool, public: bool }
     recentDirs: [], // folders ever shared, so re-adding is one click
     blockedIPs: [], // { ip, ts, note? } — rejected for guest traffic
   };
 }
 
 let config = defaultConfig();
+
+/*
+ * body.url for link shares: accepts a full "https://…" link or a bare
+ * "example.com/page" (assumes https), rejects everything else. Returns the
+ * canonical absolute URL, or null when unusable.
+ */
+function normShareUrl(v) {
+  let s = String(v ?? '').trim();
+  if (!s || s.length > 2048) return null;
+  if (!/^[a-z][a-z0-9+.-]*:/i.test(s)) {
+    if (!/^[a-z0-9-]+(\.[a-z0-9-]+)+([/?#].*)?$/i.test(s)) return null;
+    s = 'https://' + s;
+  }
+  let u;
+  try { u = new URL(s); } catch { return null; }
+  if ((u.protocol !== 'http:' && u.protocol !== 'https:') || !u.hostname) return null;
+  if (isLocalHostname(u.hostname)) return null; // guests can never reach a "localhost" link
+  return u.href;
+}
+
+/* "localhost" targets always end up on the guest's own machine — never shareable */
+function isLocalHostname(host) {
+  const h = String(host || '').toLowerCase().replace(/\.$/, '').replace(/^\[|\]$/g, '');
+  return h === 'localhost' || h.endsWith('.localhost') || /^127\./.test(h) || h === '0.0.0.0' || h === '::1' || h === '[::1]';
+}
+
 try {
   const loaded = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
   config = { ...defaultConfig(), ...loaded };
@@ -73,14 +100,19 @@ try {
   delete config.httpsEnabled;
   if (!Array.isArray(config.mounts)) config.mounts = [];
   for (const m of config.mounts) {
-    m.kind = m.kind === 'port' ? 'port' : 'folder';
+    m.kind = m.kind === 'port' ? 'port' : m.kind === 'url' ? 'url' : 'folder';
     m.lan = m.lan !== false;
     m.public = m.public === true;
     if (m.kind === 'port') {
       const p = Number(m.port);
       if (!Number.isInteger(p) || p < 1 || p > 65535) m.port = null;
+      delete m.url;
+    } else if (m.kind === 'url') {
+      m.url = normShareUrl(m.url);
+      delete m.port;
     } else {
       delete m.port;
+      delete m.url;
     }
     m.pin = /^\d{6}$/.test(String(m.pin || '')) ? String(m.pin) : null;
   }
@@ -865,10 +897,11 @@ function directoryState(ctx) {
       return m.lan !== false;                        // Wi-Fi guests: Wi-Fi-marked shares only
     })
     .map((m) => {
-      const out = { path: m.path, kind: m.kind === 'port' ? 'app' : 'folder', pin: !!m.pin };
+      const out = { path: m.path, kind: m.kind === 'port' ? 'app' : m.kind === 'url' ? 'link' : 'folder', pin: !!m.pin };
       if (ctx.local) {
         out.dir = m.dir || null;
         out.port = m.port || null;
+        out.url = m.url || null;
         out.scope = m.public ? (m.lan !== false ? 'both' : 'internet') : 'lan';
       }
       return out;
@@ -1241,7 +1274,7 @@ async function adminRoute(req, reply) {
     if (!p) return json(reply, 400, { error: 'web address must look like /photos (lowercase letters, numbers, - . _)' });
     if (isReserved(p)) return json(reply, 400, { error: `the address ${p} is reserved` });
     if (config.mounts.some((m) => m.path === p)) return json(reply, 400, { error: `the address ${p} is already used` });
-    const kind = body.kind === 'port' ? 'port' : 'folder';
+    const kind = body.kind === 'port' ? 'port' : body.kind === 'url' ? 'url' : 'folder';
     const mount = {
       id: crypto.randomUUID(),
       kind,
@@ -1256,6 +1289,10 @@ async function adminRoute(req, reply) {
         return json(reply, 400, { error: "that's the port Extranet itself runs on — it would loop forever" });
       }
       mount.port = Number(body.port);
+    } else if (kind === 'url') {
+      const url = normShareUrl(body.url);
+      if (!url) return json(reply, 400, { error: 'the link must be a web address like https://example.com/page' });
+      mount.url = url;
     } else {
       const dir = String(body.dir || '').trim();
       const st = await fsp.stat(path.resolve(dir)).catch(() => null);
@@ -1290,15 +1327,25 @@ async function adminRoute(req, reply) {
       mount.dir = path.resolve(body.dir);
       pushRecentDir(mount.dir);
     }
-    if (body.kind !== undefined && (body.kind === 'port' || body.kind === 'folder') && body.kind !== mount.kind) {
+    if (body.kind !== undefined && ['port', 'folder', 'url'].includes(body.kind) && body.kind !== mount.kind) {
       if (body.kind === 'port') {
         const err = normPortNumber(body.port !== undefined ? body.port : mount.port, 'port');
         if (err) return json(reply, 400, { error: err.error });
         mount.port = Number(body.port !== undefined ? body.port : mount.port);
+        delete mount.dir;
+        delete mount.url;
+      } else if (body.kind === 'url') {
+        const u = normShareUrl(body.url !== undefined ? body.url : mount.url);
+        if (!u) return json(reply, 400, { error: 'to switch to a link share, set the web address too' });
+        mount.url = u;
+        delete mount.port;
+        delete mount.dir;
       } else {
         const st = await fsp.stat(path.resolve(body.dir || '')).catch(() => null);
         if (!st || !st.isDirectory()) return json(reply, 400, { error: 'to switch to a folder share, pick the folder too' });
         mount.dir = path.resolve(body.dir);
+        delete mount.port;
+        delete mount.url;
       }
       mount.kind = body.kind;
     }
@@ -1309,6 +1356,11 @@ async function adminRoute(req, reply) {
         return json(reply, 400, { error: "that's the port Extranet itself runs on — it would loop forever" });
       }
       mount.port = Number(body.port);
+    }
+    if (body.url !== undefined && mount.kind === 'url') {
+      const u = normShareUrl(body.url);
+      if (!u) return json(reply, 400, { error: 'the link must be a web address like https://example.com/page' });
+      mount.url = u;
     }
     if (body.pin !== undefined) {
       const pinErr = applyPin(mount, body.pin);
@@ -1367,6 +1419,7 @@ function publicMount(m) {
     path: m.path,
     dir: m.dir,
     port: m.port,
+    url: m.url || null,
     pin: m.pin,
     lan: m.lan !== false,
     public: m.public === true,
@@ -1474,6 +1527,16 @@ async function serveShare(req, reply) {
   // 6-digit PIN check (once per device — a cookie remembers it; the owner's
   // own computer never needs it). Sends the gate page or a redirect and stops.
   if (!enforceSharePin(req, reply, mount, url)) return;
+
+  // link share: send the visitor straight to the shared web address
+  if (mount.kind === 'url') {
+    if (!mount.url) return notFoundPage(reply, 'This address is reserved for a link share, but the link is missing.');
+    return reply.code(303)
+      .header('Cache-Control', 'no-store')
+      .header('X-Robots-Tag', 'noindex')
+      .header('Location', mount.url)
+      .send();
+  }
 
   // port share: everything under the address goes to a local app instead of a folder
   if (mount.kind === 'port') return proxyPort(req, reply, mount, url);
@@ -1787,8 +1850,8 @@ async function boot() {
     lines.push('  (no LAN IP found — Wi-Fi sharing unavailable)');
   }
   lines.push('  Share folders by opening the admin page and adding them.');
-  lines.push('  Shares can ask guests for a 6-digit PIN once, and can also expose an app');
-  lines.push(`  that runs on this computer (a local port) under the same addresses.`);
+  lines.push('  Shares can ask guests for a 6-digit PIN once, expose an app that runs on');
+  lines.push('  this computer (a local port), or send guests straight to a shared link.');
   lines.push(`  Admin token (only needed to manage from another device): ${config.adminToken}`);
   lines.push('  Tip: if Windows asks about the firewall, allow Node.js on private networks.');
   console.log(lines.join('\n'));

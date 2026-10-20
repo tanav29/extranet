@@ -40,10 +40,10 @@ Useful flags: `npx . --port 6060`, `npx . --build` (rebuild the UI), `npx . --he
   OS — PowerShell `PowerStatus` on Windows, `pmset` on macOS, `/sys` on Linux —
   re-checked every minute; primary network connection; whether the host itself
   has internet), and a card for every share this visitor is allowed to see —
-  folders and app ports, with PIN and scope badges. The share list is filtered
-  per visitor: the owner sees everything, Wi-Fi guests see Wi-Fi shares,
-  internet-link guests see public shares only (and never the host's LAN
-  address). `/?json=1` (or an `Accept: application/json` request to `/`)
+  folders, app ports and links, with PIN and scope badges. The share list is
+  filtered per visitor: the owner sees everything, Wi-Fi guests see Wi-Fi
+  shares, internet-link guests see public shares only (and never the host's
+  LAN address). `/?json=1` (or an `Accept: application/json` request to `/`)
   returns the same data as JSON. The admin console stays at `/admin`.
 - **Desktop-style UI** — a fixed sidebar + canvas app frame: the console puts
   the share list front and center with network and internet-link panels in a
@@ -62,6 +62,13 @@ Useful flags: `npx . --port 6060`, `npx . --build` (rebuild the UI), `npx . --he
   any other (Wi-Fi scope, internet scope, PIN), and every request under the
   address is forwarded to that local port with the prefix stripped. Plain HTTP
   requests are forwarded; websockets are not supported on the share.
+- **Link shares** — share any web link under a short address:
+  `/docs` → `https://example.com/some-very-long-page`. Guests who open the
+  address are sent straight to the link (empty sub-paths redirect the same
+  way). Paste the URL in the console — a bare `example.com/page` gets an
+  `https://` prefix, `localhost` links are refused (guests can't reach your
+  machine's own ports — use an app-port share for that). Works with the
+  Wi-Fi scope, the internet link and PIN exactly like the other kinds.
 - **One-time PIN lock (6 digits)** — any share can require a 6-digit PIN.
   Guests either open a link that carries it (`/movies/?pin=123456`) or type it
   on a small lock page. Their browser remembers it for 6 months, so nobody has
