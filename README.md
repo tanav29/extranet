@@ -1,11 +1,11 @@
 # Extranet
 
-Share folders from your computer with the people around you — over your Wi-Fi,
-or with anyone anywhere through a Cloudflare link.
+Share folders and apps from your computer with the people around you — over
+your Wi-Fi, or with anyone anywhere through a Cloudflare link.
 
 Guests get a dead-simple page: browse folders, view photos / PDFs / video / text
-right in the browser, and download anything (or a whole folder as a single
-`.zip`).
+right in the browser, download anything (or a whole folder as a single
+`.zip`), and open an app that runs on this computer under a short address.
 
 ```
 npx .          # from this repo
@@ -20,12 +20,13 @@ Then open **http://localhost:5050/admin** on the same computer.
 bin/cli.js           the launcher — the only thing you run (npx / npm start)
 server/index.js      the Fastify server app: shares, PINs, proxying, ZIP, analytics
 app/                 the Vite + React + Tailwind source (admin, guest, analytics)
-public/app/          the compiled UI that the server serves statically
+app/dist/            the compiled UI the server serves (gitignored; built on demand)
 data/                runtime data: config.json, logs.json, cloudflared helper
 ```
 
 Backend = one self-contained Fastify app in `server/`. Frontend = one Vite app
-in `app/`, built into `public/app/` — no server-side templating. Everything is
+in `app/`, built into `app/dist/` — no server-side templating. Fonts load from
+Google Fonts at runtime, so no font files live in the repo. Everything is
 started through `bin/cli.js`, so `npx`, `npm start` and a symlinked global
 install all behave the same. Runtime data lives in `data/` next to the repo;
 for an installed copy it moves to `~/.extranet/data`. `--port <n>` (or the
@@ -40,7 +41,7 @@ Useful flags: `npx . --port 6060`, `npx . --build` (rebuild the UI), `npx . --he
   OS — PowerShell `PowerStatus` on Windows, `pmset` on macOS, `/sys` on Linux —
   re-checked every minute; primary network connection; whether the host itself
   has internet), and a card for every share this visitor is allowed to see —
-  folders, app ports and links, with PIN and scope badges. The share list is
+  folders and app ports, with PIN and scope badges. The share list is
   filtered per visitor: the owner sees everything, Wi-Fi guests see Wi-Fi
   shares, internet-link guests see public shares only (and never the host's
   LAN address). `/?json=1` (or an `Accept: application/json` request to `/`)
@@ -52,23 +53,30 @@ Useful flags: `npx . --port 6060`, `npx . --build` (rebuild the UI), `npx . --he
   status bar. All panes scroll inside the frame, with a light/dark toggle.
 - **Real shadcn/ui** — the admin console, the guest page, and analytics are
   built with actual shadcn/ui components (React + Tailwind + Radix) in `app/`,
-  compiled into `public/app/` and served statically. Bump the design by
+  compiled into `app/dist/` and served statically. Bump the design by
   editing `app/src` and rebuilding.
 - **Folder shares** — map any folder to a short web address, e.g.
   `D:\Movies` → `/movies`. Guests open `http://<your-ip>:5050/movies/`.
   Each share can be visible on the Wi-Fi, through the internet link, or both.
 - **App-port shares** — expose anything already running on this computer under
   the same style of address: `/webapp` → `127.0.0.1:3000`. The share works like
-  any other (Wi-Fi scope, internet scope, PIN), and every request under the
-  address is forwarded to that local port with the prefix stripped. Plain HTTP
-  requests are forwarded; websockets are not supported on the share.
-- **Link shares** — share any web link under a short address:
-  `/docs` → `https://example.com/some-very-long-page`. Guests who open the
-  address are sent straight to the link (empty sub-paths redirect the same
-  way). Paste the URL in the console — a bare `example.com/page` gets an
-  `https://` prefix, `localhost` links are refused (guests can't reach your
-  machine's own ports — use an app-port share for that). Works with the
-  Wi-Fi scope, the internet link and PIN exactly like the other kinds.
+  any other (Wi-Fi scope, internet scope, PIN). Every request under the address
+  is forwarded to that local port with the prefix stripped; websockets are not
+  supported.
+  Apps usually expect to own a whole site: they write root-absolute paths
+  (`/static/app.css`), absolute form actions, and `Location: /login` — fine at
+  an origin of their own, broken under a path. The share repairs that on its
+  own, without subdomains or an app-side base-path setting: opening
+  `/webapp` redirects to `/webapp/`, complete (uncompressed, reasonably small)
+  HTML and CSS responses are rewritten in place so root-absolute references
+  resolve under the share, `Set-Cookie: Path=/` and `Location:` headers are
+  repointed, and URLs the app's JavaScript builds at runtime
+  (`fetch('/api/…')` and friends) reach the app through a fallback rule: while
+  exactly one app share is visible to a visitor, unmatched paths go to it too.
+  Streamed, compressed or oversized responses pass through untouched; inline
+  `<script>` bodies keep their exact bytes. With two or more app shares
+  visible at once the fallback is ambiguous and unmatched paths show the
+  not-found page.
 - **One-time PIN lock (6 digits)** — any share can require a 6-digit PIN.
   Guests either open a link that carries it (`/movies/?pin=123456`) or type it
   on a small lock page. Their browser remembers it for 6 months, so nobody has
@@ -100,17 +108,21 @@ Useful flags: `npx . --port 6060`, `npx . --build` (rebuild the UI), `npx . --he
 
 ## Rebuilding the UI
 
-The server serves the prebuilt bundle in `public/app/`. To change the design:
+The server serves the prebuilt bundle in `app/dist/`. To change the design:
 
 ```
 npm run setup       # once — installs React/Vite/Tailwind/shadcn deps inside app/
-npm run build       # rebuilds public/app from app/src
+npm run build       # rebuilds app/dist from app/src
 ```
 
-For live-reload UI work: `npm run setup`, run `npm start` (the Fastify server),
-then `npm run dev` inside `app/` and open the Vite URL — API calls are proxied
-to the Fastify server automatically. To check that all
-three pages still boot against a running server: `npm run smoke`.
+`app/dist/` is gitignored: the launcher builds it itself when it's missing
+(and a build toolchain is installed), and an npm-packaged copy carries it via
+the `files` list built right before publishing. For live-reload UI work:
+`npm run setup`, run `npm start` (the Fastify server), then `npm run dev`
+inside `app/` and open the Vite URL — API calls are proxied to the Fastify
+server automatically. To check that the three pages still boot against a
+running server: `npm run smoke` (it picks up the running port from
+`EXTRANET_PORT` or `data/config.json`).
 
 ## Ports
 
@@ -144,7 +156,7 @@ HTTPS when used over the internet.
 bin/                 the npx launcher
 server/index.js      the Fastify server
 app/                 the real shadcn/ui frontend (React + Tailwind)
-public/app/          the compiled UI the server serves
+app/dist/            the compiled UI the server serves (gitignored, built from app/)
 data/config.json     settings, shares (with their PINs), recent folders, blocked IPs
 data/logs.json       access log for /analytics (last 3000 requests)
 data/bin/            cloudflared, if you used "Set up"
@@ -159,10 +171,10 @@ data/bin/            cloudflared, if you used "Set up"
 - The public link is someone's whole-internet access — only mark folders
   **Internet** that you're comfortable with strangers seeing (the PIN gate
   helps here; you can also always stop the link or un-mark the share).
-- App-port shares forward the browser's requests to a local port: keep in mind
-  apps with absolute asset paths (`/static/...`) need their base path set to
-  the share address, or use a `x-forwarded-prefix`-aware setting when they
-  support one.
+- App-port shares repair root-absolute HTML/CSS references and give
+  runtime-built URLs a fallback path (see "App-port shares" above), so apps
+  usually work as-is. An app-side base-path setting is still the cleaner
+  mechanism when one exists, but it's no longer required.
 - iOS PDF preview can be stubborn inside the page; use the download button or
   "open in new tab" there.
 

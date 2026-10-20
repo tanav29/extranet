@@ -9,11 +9,10 @@ import { cn } from "@/lib/utils";
 
 type Share = {
   path: string;
-  kind: "folder" | "app" | "link";
+  kind: "folder" | "app";
   pin: boolean;
   dir?: string | null;
   port?: number | null;
-  url?: string | null;
   scope?: "lan" | "internet" | "both";
 };
 
@@ -187,12 +186,12 @@ function ShareCard({ s, local }: { s: Share; local?: boolean }) {
       className="group relative flex items-start gap-3 rounded-xl border bg-card p-4 shadow-sm transition-colors hover:border-ring hover:bg-accent/40 focus-visible:outline-2 focus-visible:outline-ring/70"
     >
       <span className={badge}>
-        {s.kind === "app" ? <AppWindow className="size-5" /> : s.kind === "link" ? <Link2 className="size-5" /> : <Folder className="size-5" />}
+        {s.kind === "app" ? <AppWindow className="size-5" /> : <Folder className="size-5" />}
       </span>
       <div className="min-w-0 flex-1">
         <div className="truncate font-mono text-[13.5px] font-medium">{s.path}</div>
         <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
-          <span className={badgeCls}>{s.kind === "app" ? "app" : s.kind === "link" ? "link" : "folder"}</span>
+          <span className={badgeCls}>{s.kind === "app" ? "app" : "folder"}</span>
           {s.pin && <span className={badgeCls}><Lock /> PIN</span>}
           {scope && (
             <span className={badgeCls}>
@@ -201,9 +200,9 @@ function ShareCard({ s, local }: { s: Share; local?: boolean }) {
             </span>
           )}
         </div>
-        {local && !!(s.dir || s.port || s.url) && (
-          <div className="mt-1 truncate text-[11px] text-muted-foreground" title={s.dir ? `${s.dir}` : s.url ? `${s.url}` : `port ${s.port}`}>
-            {s.dir ? s.dir : s.url ? s.url : `→ 127.0.0.1:${s.port}`}
+        {local && !!(s.dir || s.port) && (
+          <div className="mt-1 truncate text-[11px] text-muted-foreground" title={s.dir ? `${s.dir}` : `port ${s.port}`}>
+            {s.dir ? s.dir : `→ 127.0.0.1:${s.port}`}
           </div>
         )}
       </div>

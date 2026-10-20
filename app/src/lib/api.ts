@@ -18,16 +18,19 @@ export class ApiError extends Error {
 
 export async function api<T = any>(
   pathname: string,
-  opts: RequestInit & { body?: unknown } = {}
+  opts: Omit<RequestInit, "body"> & { body?: unknown } = {}
 ): Promise<T> {
   const headers = new Headers(opts.headers as HeadersInit | undefined);
   headers.set("Authorization", "Bearer " + getToken());
-  const init: RequestInit = { ...opts, headers };
-  if (opts.body !== undefined && typeof opts.body !== "string") {
-    init.body = JSON.stringify(opts.body);
+  const { body, ...rest } = opts;
+  let bodyInit: BodyInit | undefined;
+  if (body !== undefined && typeof body !== "string") {
+    bodyInit = JSON.stringify(body);
     headers.set("Content-Type", "application/json");
+  } else if (typeof body === "string") {
+    bodyInit = body;
   }
-  const r = await fetch(pathname, init);
+  const r = await fetch(pathname, { ...rest, body: bodyInit, headers });
   if (r.status === 401) throw new ApiError("token needed", 401);
   const data = await r.json().catch(() => ({}));
   if (!r.ok) throw new ApiError((data as any).error || "error " + r.status, r.status);

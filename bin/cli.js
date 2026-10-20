@@ -68,7 +68,7 @@ if (port != null) {
 }
 
 function uiBuilt() {
-  return fs.existsSync(path.join(ROOT, 'public', 'app', 'admin.html'));
+  return fs.existsSync(path.join(UI_DIR, 'dist', 'admin.html'));
 }
 
 function buildUI() {

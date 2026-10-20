@@ -1,13 +1,14 @@
 #!/usr/bin/env node
 /*
- * Extranet — share folders from this computer.
+ * Extranet — share folders and app ports from this computer.
  *
  *  - Fastify Node.js server (plain HTTP — the self-signed HTTPS mode was removed)
  *  - Serves each configured folder ("share") under a URL path, e.g. /photos
- *  - Can also expose a port of this computer under a URL path (/webapp → 127.0.0.1:3000)
- *  - Or redirect guests straight to a shared link (/docs → https://example.com/doc)
+ *  - Can also expose a port of this computer under a URL path (/webapp → 127.0.0.1:3000);
+ *    root-absolute references the app writes into its HTML/CSS are repointed
+ *    under the share path, and its own assets keep loading (no subdomains)
  *  - Shares can be locked with a 6-digit PIN; guests enter it once (cookie) or pass it in the URL (?pin=123456)
- *  - The React app in app/ compiles into public/app and is served statically:
+ *  - The React app in app/ compiles into app/dist and is served statically:
  *    admin console (/admin), guest browser (any share path), analytics (/analytics),
  *    and a guest start page (/): directory of visible shares + host facts
  *  - LAN over HTTP, plus a Cloudflare quick-tunnel for internet access
@@ -31,15 +32,16 @@ const Fastify = require('fastify');
 
 /*
  * Paths. The package layout is:  bin/ (launcher) + server/ (this app) +
- * public/ (the compiled UI, served statically) + app/ (the Vite source).
- * Everything that changes at runtime (config, logs, the cloudflared helper)
- * lives in a data dir: EXTRANET_DATA_DIR, the repo's ./data when present, or
- * ~/.extranet/data for a globally installed copy.
+ * app/ (the Vite source; `npm run build` compiles it into app/dist, which
+ * is served statically) + data/ (runtime: config, logs, the cloudflared
+ * helper). Everything that changes at runtime lives in a data dir:
+ * EXTRANET_DATA_DIR, the repo's ./data when present, or ~/.extranet/data
+ * for a globally installed copy.
  */
 const ROOT = path.join(__dirname, '..');
 const PUBLIC_DIR = process.env.EXTRANET_PUBLIC_DIR
   ? path.resolve(process.env.EXTRANET_PUBLIC_DIR)
-  : path.join(ROOT, 'public');
+  : path.join(ROOT, 'app', 'dist');
 const DATA_DIR = process.env.EXTRANET_DATA_DIR
   ? path.resolve(process.env.EXTRANET_DATA_DIR)
   : (fs.existsSync(path.join(ROOT, 'data')) ? path.join(ROOT, 'data')
@@ -60,7 +62,7 @@ function defaultConfig() {
   return {
     httpPort: 5050,
     adminToken: crypto.randomBytes(6).toString('hex'),
-    mounts: [], // { id, kind: "folder"|"port"|"url", path: "/name", dir?, port?, url?, pin?, lan: bool, public: bool }
+    mounts: [], // { id, kind: "folder"|"port", path: "/name", dir?, port?, pin?, lan: bool, public: bool }
     recentDirs: [], // folders ever shared, so re-adding is one click
     blockedIPs: [], // { ip, ts, note? } — rejected for guest traffic
   };
@@ -68,51 +70,24 @@ function defaultConfig() {
 
 let config = defaultConfig();
 
-/*
- * body.url for link shares: accepts a full "https://…" link or a bare
- * "example.com/page" (assumes https), rejects everything else. Returns the
- * canonical absolute URL, or null when unusable.
- */
-function normShareUrl(v) {
-  let s = String(v ?? '').trim();
-  if (!s || s.length > 2048) return null;
-  if (!/^[a-z][a-z0-9+.-]*:/i.test(s)) {
-    if (!/^[a-z0-9-]+(\.[a-z0-9-]+)+([/?#].*)?$/i.test(s)) return null;
-    s = 'https://' + s;
-  }
-  let u;
-  try { u = new URL(s); } catch { return null; }
-  if ((u.protocol !== 'http:' && u.protocol !== 'https:') || !u.hostname) return null;
-  if (isLocalHostname(u.hostname)) return null; // guests can never reach a "localhost" link
-  return u.href;
-}
-
-/* "localhost" targets always end up on the guest's own machine — never shareable */
-function isLocalHostname(host) {
-  const h = String(host || '').toLowerCase().replace(/\.$/, '').replace(/^\[|\]$/g, '');
-  return h === 'localhost' || h.endsWith('.localhost') || /^127\./.test(h) || h === '0.0.0.0' || h === '::1' || h === '[::1]';
-}
-
 try {
   const loaded = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
   config = { ...defaultConfig(), ...loaded };
   delete config.httpsPort;          // the HTTPS mode is gone — ignore leftovers
   delete config.httpsEnabled;
   if (!Array.isArray(config.mounts)) config.mounts = [];
+  // link mounts (kind "url") are retired: drop them instead of half-serving them
+  config.mounts = config.mounts.filter((m) => m && typeof m === 'object' && m.kind !== 'url');
   for (const m of config.mounts) {
-    m.kind = m.kind === 'port' ? 'port' : m.kind === 'url' ? 'url' : 'folder';
+    m.kind = m.kind === 'port' ? 'port' : 'folder';
     m.lan = m.lan !== false;
     m.public = m.public === true;
+    delete m.url;
     if (m.kind === 'port') {
       const p = Number(m.port);
       if (!Number.isInteger(p) || p < 1 || p > 65535) m.port = null;
-      delete m.url;
-    } else if (m.kind === 'url') {
-      m.url = normShareUrl(m.url);
-      delete m.port;
     } else {
       delete m.port;
-      delete m.url;
     }
     m.pin = /^\d{6}$/.test(String(m.pin || '')) ? String(m.pin) : null;
   }
@@ -292,10 +267,9 @@ function pinGatePage(reply, mountPath, opts) {
 </form>`);
 }
 
-/**
- * Returns true when access may continue, false when a gate response was sent.
- * Fills `req.__pinJustOk` so hijacked routes (zip / proxy / files) can still
- * attach the Set-Cookie header before FLUSHING the raw response.
+/*
+ * Returns true when access may continue; false when a gate response (or the
+ * redirect that consumes the entered PIN) has already been sent.
  */
 function enforceSharePin(req, reply, mount, url) {
   if (!mount.pin || req.ctx.local) return true;
@@ -402,7 +376,6 @@ function isTrackablePath(p) {
   if (p.startsWith('/admin')) return false;
   if (p === '/app' || p.startsWith('/app/')) return false;
   if (p === '/analytics') return false;
-  if (p === '/fonts.css' || p.startsWith('/fonts/')) return false;
   if (p === '/favicon.ico' || p === '/robots.txt') return false;
   return true;
 }
@@ -897,11 +870,10 @@ function directoryState(ctx) {
       return m.lan !== false;                        // Wi-Fi guests: Wi-Fi-marked shares only
     })
     .map((m) => {
-      const out = { path: m.path, kind: m.kind === 'port' ? 'app' : m.kind === 'url' ? 'link' : 'folder', pin: !!m.pin };
+      const out = { path: m.path, kind: m.kind === 'port' ? 'app' : 'folder', pin: !!m.pin };
       if (ctx.local) {
         out.dir = m.dir || null;
         out.port = m.port || null;
-        out.url = m.url || null;
         out.scope = m.public ? (m.lan !== false ? 'both' : 'internet') : 'lan';
       }
       return out;
@@ -927,7 +899,7 @@ function directoryState(ctx) {
 /* The Fastify app                                                     */
 /* ------------------------------------------------------------------ */
 
-/* Built frontend (app/ → npm run build → public/app) */
+/* Built frontend (app/ → npm run build → app/dist) */
 const APP_TYPES = {
   '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8',
   '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml',
@@ -937,7 +909,7 @@ const APP_TYPES = {
 };
 
 function appPage(name) {
-  try { return fs.readFileSync(path.join(PUBLIC_DIR, 'app', name)); }
+  try { return fs.readFileSync(path.join(PUBLIC_DIR, name)); }
   catch {
     return Buffer.from(pageHTML('UI not built', `<h1>UI not built</h1>
 <p>The interface is missing. Run <code>npx extranet --build</code> (or <code>npm run build --prefix app</code>) once, then restart.</p>`));
@@ -988,8 +960,6 @@ function buildApp() {
 
   app.get('/favicon.ico', faviconRoute);
   app.get('/robots.txt', robotsRoute);
-  app.get('/fonts.css', fontsRoute);
-  app.get('/fonts/*', fontsRoute);
   app.all('/app', appAssetRoute);   // non-GET methods must still 405, like before
   app.all('/app/*', appAssetRoute);
   app.all('/admin', adminRoute);
@@ -1063,24 +1033,12 @@ async function robotsRoute(_req, reply) {
   return reply.code(200).type('text/plain').send('User-agent: *\nDisallow: /\n');
 }
 
-async function fontsRoute(req, reply) {
-  const { pathname } = new URL(req.raw.url || '/fonts.css', 'http://internal');
-  const rel = pathname.slice(1).replace(/\.\./g, '');
-  const fp = path.join(PUBLIC_DIR, rel);
-  if (!fp.startsWith(PUBLIC_DIR)) return reply.code(403).send();
-  let data = null;
-  try { data = fs.readFileSync(fp); } catch { /* fall through */ }
-  if (!data) return reply.code(404).send();
-  const type = fp.endsWith('.css') ? 'text/css; charset=utf-8' : fp.endsWith('.woff2') ? 'font/woff2' : 'application/octet-stream';
-  return reply.code(200).type(type).header('Cache-Control', 'public, max-age=86400').send(data);
-}
-
 async function appAssetRoute(req, reply) {
   const { pathname } = new URL(req.raw.url || '/app', 'http://internal');
   if (req.raw.method !== 'GET' && req.raw.method !== 'HEAD') return reply.code(405).send();
   let rel;
   try { rel = decodeURIComponent(pathname.slice('/app/'.length)).replace(/\.\.+/g, ''); } catch { return reply.code(400).send(); }
-  const base = path.join(PUBLIC_DIR, 'app');
+  const base = PUBLIC_DIR;         // the Vite bundle writes assets/ next to the pages
   const fp = path.resolve(base, rel);
   if (!fp.startsWith(base + path.sep)) return reply.code(403).send();
   let data;
@@ -1173,7 +1131,7 @@ function applyPin(mount, value) {
   return null;
 }
 
-const RESERVED_PREFIXES = ['/admin', '/analytics', '/app', '/favicon.ico', '/robots.txt', '/fonts'];
+const RESERVED_PREFIXES = ['/admin', '/analytics', '/app', '/favicon.ico', '/robots.txt'];
 
 function isReserved(p) {
   return RESERVED_PREFIXES.some((r) => p === r || p.startsWith(r + '/'));
@@ -1274,7 +1232,7 @@ async function adminRoute(req, reply) {
     if (!p) return json(reply, 400, { error: 'web address must look like /photos (lowercase letters, numbers, - . _)' });
     if (isReserved(p)) return json(reply, 400, { error: `the address ${p} is reserved` });
     if (config.mounts.some((m) => m.path === p)) return json(reply, 400, { error: `the address ${p} is already used` });
-    const kind = body.kind === 'port' ? 'port' : body.kind === 'url' ? 'url' : 'folder';
+    const kind = body.kind === 'port' ? 'port' : 'folder';
     const mount = {
       id: crypto.randomUUID(),
       kind,
@@ -1289,10 +1247,6 @@ async function adminRoute(req, reply) {
         return json(reply, 400, { error: "that's the port Extranet itself runs on — it would loop forever" });
       }
       mount.port = Number(body.port);
-    } else if (kind === 'url') {
-      const url = normShareUrl(body.url);
-      if (!url) return json(reply, 400, { error: 'the link must be a web address like https://example.com/page' });
-      mount.url = url;
     } else {
       const dir = String(body.dir || '').trim();
       const st = await fsp.stat(path.resolve(dir)).catch(() => null);
@@ -1327,25 +1281,17 @@ async function adminRoute(req, reply) {
       mount.dir = path.resolve(body.dir);
       pushRecentDir(mount.dir);
     }
-    if (body.kind !== undefined && ['port', 'folder', 'url'].includes(body.kind) && body.kind !== mount.kind) {
+    if (body.kind !== undefined && ['port', 'folder'].includes(body.kind) && body.kind !== mount.kind) {
       if (body.kind === 'port') {
         const err = normPortNumber(body.port !== undefined ? body.port : mount.port, 'port');
         if (err) return json(reply, 400, { error: err.error });
         mount.port = Number(body.port !== undefined ? body.port : mount.port);
-        delete mount.dir;
-        delete mount.url;
-      } else if (body.kind === 'url') {
-        const u = normShareUrl(body.url !== undefined ? body.url : mount.url);
-        if (!u) return json(reply, 400, { error: 'to switch to a link share, set the web address too' });
-        mount.url = u;
-        delete mount.port;
         delete mount.dir;
       } else {
         const st = await fsp.stat(path.resolve(body.dir || '')).catch(() => null);
         if (!st || !st.isDirectory()) return json(reply, 400, { error: 'to switch to a folder share, pick the folder too' });
         mount.dir = path.resolve(body.dir);
         delete mount.port;
-        delete mount.url;
       }
       mount.kind = body.kind;
     }
@@ -1356,11 +1302,6 @@ async function adminRoute(req, reply) {
         return json(reply, 400, { error: "that's the port Extranet itself runs on — it would loop forever" });
       }
       mount.port = Number(body.port);
-    }
-    if (body.url !== undefined && mount.kind === 'url') {
-      const u = normShareUrl(body.url);
-      if (!u) return json(reply, 400, { error: 'the link must be a web address like https://example.com/page' });
-      mount.url = u;
     }
     if (body.pin !== undefined) {
       const pinErr = applyPin(mount, body.pin);
@@ -1419,7 +1360,6 @@ function publicMount(m) {
     path: m.path,
     dir: m.dir,
     port: m.port,
-    url: m.url || null,
     pin: m.pin,
     lan: m.lan !== false,
     public: m.public === true,
@@ -1518,7 +1458,23 @@ async function serveShare(req, reply) {
 
   const urlPath = '/' + segs.join('/');
   const wantPublic = ctx.isTunnel;
-  const mount = findMount(urlPath, wantPublic);
+  let mount = findMount(urlPath, wantPublic);
+  if (!mount) {
+    /*
+     * No share claims this address. When exactly one app port is visible to
+     * this visitor, assume the app owns the whole root — that's the only sane
+     * way root-absolute requests it writes at runtime (fetch('/api/…') and
+     * friends, which never pass through the HTML) can reach it under a path
+     * address. Every other kind stays address-scoped; two app ports on at
+     * once are ambiguous and fall back to the not-found page.
+     */
+    const soleApp = soleVisiblePortShare(wantPublic);
+    if (soleApp) {
+      if (!enforceSharePin(req, reply, soleApp, url)) return;
+      if (req.__ev) req.__ev.share = soleApp.path; // keep analytics attribution honest
+      return proxyPort(req, reply, soleApp, url, '');
+    }
+  }
   if (!mount || !(mount.lan || ctx.isTunnel)) {
     if (ctx.isTunnel) return notFoundPage(reply, 'Nothing is shared under this address on the public link.');
     return notFoundPage(reply, 'Nothing is shared under this address.');
@@ -1528,18 +1484,20 @@ async function serveShare(req, reply) {
   // own computer never needs it). Sends the gate page or a redirect and stops.
   if (!enforceSharePin(req, reply, mount, url)) return;
 
-  // link share: send the visitor straight to the shared web address
-  if (mount.kind === 'url') {
-    if (!mount.url) return notFoundPage(reply, 'This address is reserved for a link share, but the link is missing.');
-    return reply.code(303)
-      .header('Cache-Control', 'no-store')
-      .header('X-Robots-Tag', 'noindex')
-      .header('Location', mount.url)
-      .send();
-  }
-
   // port share: everything under the address goes to a local app instead of a folder
-  if (mount.kind === 'port') return proxyPort(req, reply, mount, url);
+  if (mount.kind === 'port') {
+    // /webapp → /webapp/ : document-relative refs inside the app then resolve
+    // under the share instead of the server root
+    const method = String(req.raw.method || 'GET').toUpperCase();
+    if ((method === 'GET' || method === 'HEAD') && urlPath === mount.path && !parsedPath.trailing) {
+      return reply.code(301)
+        .header('Cache-Control', 'no-store')
+        .header('X-Robots-Tag', 'noindex')
+        .header('Location', mount.path + '/' + (url.search || ''))
+        .send();
+    }
+    return proxyPort(req, reply, mount, url);
+  }
 
   // compute absolute path within the mount
   const relSegs = segs.slice(mount.path.split('/').length - 1);
@@ -1583,17 +1541,314 @@ const HOP_SKIP_RES = new Set([
 ]);
 const NOT_BODY_METHODS = new Set(['GET', 'HEAD', 'OPTIONS', 'TRACE', 'CONNECT']);
 
-function proxyTargetPath(url, mount) {
-  let rest = '/';
-  if (url.pathname.startsWith(mount.path + '/')) rest = url.pathname.slice(mount.path.length);
-  else if (url.pathname === mount.path) rest = '/';
+/*
+ * An app shared under a path address expects to own the whole site: it writes
+ * root-absolute references (/static/app.css), absolute form actions, and
+ * Location: /login. Under /webapp those hit the server root and break. Two
+ * mechanisms keep them working without subdomains:
+ *
+ *  1. serveShare redirects /webapp → /webapp/ (so document-relative refs
+ *     resolve under the share), and HTML + CSS responses that arrive complete,
+ *     uncompressed and reasonably small are rewritten in place: root-absolute
+ *     refs in markup and css are repointed under the share path. Inline
+ *     JavaScript keeps its exact bytes; streamed, compressed and oversized
+ *     bodies pass through untouched rather than being approximated.
+ *  2. When no share claims an address and exactly one app port is visible to
+ *     this visitor, that app also answers unmatched paths (see
+ *     soleVisiblePortShare) — that is the part rewriting cannot see: URLs the
+ *     app's JavaScript builds at runtime.
+ */
+
+const REWRITE_LIMIT = 4 * 1024 * 1024;
+const REWRITEABLE_TYPE = /(?:^|;)\s*(?:application\/xhtml(?:\+xml)?|text\/(?:html|css))\s*(?:;|$)/i;
+
+/* attributes that carry URLs the guest's browser will load */
+const REF_ATTRS = new Set([
+  'src', 'href', 'action', 'formaction', 'poster', 'manifest',
+  'xlink:href', 'data-src', 'data-href', 'data-url',
+]);
+const SRCSET_ATTRS = new Set(['srcset', 'imagesrcset']);
+const SCRIPT_OPEN_RE = /<script\b(?:[^>'"]|"[^"]*"|'[^']*')*>/gi;
+const STYLE_BLOCK_RE = /(<style\b[^>]*>)([\s\S]*?)(<\/style[^>]*>)/gi;
+const MARKUP_TAG_RE = /<([a-zA-Z][\w:.-]*)([^>]*)>/g;
+const MARKUP_ATTR_RE = /\s([a-zA-Z][\w:.-]*)\s*=\s*("[^"]*"|'[^']*'|[^\s"'=<>`]+)/g;
+
+/*
+ * Returns the ref repointed into the share, or null when it must stay as-is:
+ * empty / fragmentish values, protocol-relative and backslash forms (//host,
+ * /\host read as hosts in browsers), and refs the app already writes under
+ * the share path.
+ */
+function shareRef(value, mountPath) {
+  const v = String(value ?? '');
+  if (!v) return null;
+  if (v.charCodeAt(0) !== 0x2f) return null;                        // '/…' only
+  if (v.length > 1) {
+    const c = v.charCodeAt(1);
+    if (c === 0x2f || c === 0x5c) return null;                      // '//' , '/\'
+  }
+  if (v === mountPath || v.startsWith(mountPath + '/')) return null; // already shared
+  return mountPath + v;
+}
+
+function rewriteSrcsetValue(value, mountPath) {
+  return String(value).split(',').map((part) => part.replace(
+    /^(\s*)(\S*)/,
+    (m, pad, url) => {
+      const nv = shareRef(url, mountPath);
+      return nv ? pad + nv : m;
+    },
+  )).join(',');
+}
+
+/* url(/a.png), @import url(/theme.css) and @import "/theme.css" */
+function rewriteCssText(css, mountPath) {
+  return String(css)
+    .replace(/url\(\s*('((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)"|([^'"\s()]*))\s*\)/gi,
+      (m, q, sq, dq, bare) => {
+        const v = sq !== undefined ? sq : dq !== undefined ? dq : bare;
+        const nv = shareRef(v, mountPath);
+        if (!nv) return m;
+        const close = q[0] === "'" || q[0] === '"' ? q[0] : '';
+        return `url(${close}${nv}${close})`;
+      })
+    .replace(/@import\s+(?:'([^']*)'|"([^"]*)")(?=[\s;{,}]|$)/gi,
+      (m, sq, dq) => {
+        const v = sq !== undefined ? sq : dq;
+        const nv = shareRef(v, mountPath);
+        if (!nv) return m;
+        return `@import ${sq !== undefined ? "'" : '"'}${nv}${sq !== undefined ? "'" : '"'}`;
+      });
+}
+
+/* attribute pass within one tag — only URL-carrying values are repointed,
+   while tag syntax outside the value (name, =, quotes, spacing) is kept
+   intact so the document never shifts around a changed ref */
+function rewriteTagAttrs(tagAttrs, mountPath) {
+  return tagAttrs.replace(MARKUP_ATTR_RE, (m, name, value) => {
+    const attr = name.toLowerCase();
+    const quoted = value.charCodeAt(0) === 0x22 || value.charCodeAt(0) === 0x27;
+    const head = quoted ? value[0] : '';
+    const tail = quoted && value[value.length - 1] === value[0] ? value[0] : '';
+    const inner = quoted ? value.slice(1, value.length - (tail ? 1 : 0)) : value;
+
+    let nv = null;
+    if (SRCSET_ATTRS.has(attr)) nv = rewriteSrcsetValue(inner, mountPath);
+    else if (REF_ATTRS.has(attr)) nv = shareRef(inner, mountPath);
+    else if (attr === 'style') nv = rewriteCssText(inner, mountPath);
+    else if (attr === 'content') {
+      // <meta http-equiv="refresh" content="0; url=/next">
+      nv = inner.replace(/^([0-9.]+\s*;[^;]*?url=)\/(?!\/)(.*)$/is, (n, pre, rest) => {
+        const pr = shareRef('/' + rest, mountPath);
+        return pr ? pre + pr : n;
+      });
+    }
+    if (nv == null || nv === inner) return m;
+    return m.slice(0, m.length - value.length) + head + nv + tail;
+  });
+}
+
+/* attributes inside real tags; text nodes, comments and doctypes stay untouched */
+function rewriteTags(html, mountPath) {
+  MARKUP_TAG_RE.lastIndex = 0;
+  let out = '';
+  let from = 0;
+  let t;
+  while ((t = MARKUP_TAG_RE.exec(html))) {
+    out += html.slice(from, t.index)
+      + t[0].slice(0, t[0].length - t[2].length - 1)  // '<'+name up to the attrs
+      + rewriteTagAttrs(t[2], mountPath) + '>';
+    from = t.index + t[0].length;
+  }
+  return out + html.slice(from);
+}
+
+/* markup without script elements: tag attributes plus inline <style> bodies.
+   <style> content is CSS-shaped text, so it gets the same treatment as a
+   .css response; an unterminated one simply stays raw. */
+function rewriteMarkup(html, mountPath) {
+  STYLE_BLOCK_RE.lastIndex = 0;
+  let out = '';
+  let from = 0;
+  let s;
+  while ((s = STYLE_BLOCK_RE.exec(html))) {
+    out += rewriteTags(html.slice(from, s.index), mountPath)
+      + s[1] + rewriteCssText(s[2], mountPath) + s[3];
+    from = s.index + s[0].length;
+  }
+  out += rewriteTags(html.slice(from), mountPath);
+  return out;
+}
+
+/*
+ * script elements keep their exact bytes — a damaged page is worse than an
+ * unrewritten one — but the <script src=…> open tag still gets its attributes
+ * repointed, and so does everything between script elements. An element with
+ * no closing tag, or no '>' ending the closing tag, leaves the whole document
+ * untouched instead of guessing where the code ends.
+ */
+function rewriteHtmlDoc(text, mountPath) {
+  SCRIPT_OPEN_RE.lastIndex = 0;
+  const lower = text.toLowerCase();
+  let out = '';
+  let from = 0;
+  let s;
+  while ((s = SCRIPT_OPEN_RE.exec(text))) {
+    const openEnd = s.index + s[0].length;
+    const end = lower.indexOf('</script', openEnd);
+    if (end < 0) return text; // unterminated script: leave instead of guessing
+    const closeEnd = lower.indexOf('>', end);
+    if (closeEnd < 0) return text;
+    out += rewriteMarkup(text.slice(from, s.index), mountPath)
+      + rewriteMarkup(s[0], mountPath)              // open tag, incl. src=
+      + text.slice(openEnd, end)                    // body, byte-exact
+      + text.slice(end, closeEnd + 1);              // </script … >
+    from = closeEnd + 1;
+  }
+  out += rewriteMarkup(text.slice(from), mountPath);
+  return out;
+}
+
+/* keep app cookies from colliding between two port shares: root scope moves to the share */
+function scopeCookiePath(cookie, mountPath) {
+  return String(cookie).replace(/;(\s*)path\s*=\s*\/(?=[;\s]|$)/i, `;$1Path=${mountPath}/`);
+}
+
+/*
+ * Location header: prefix path-absolute targets; absolute URLs minted against
+ * the upstream host (127.0.0.1:<port>) become share-relative.
+ */
+function proxyLocation(value, mountPath) {
+  let v = String(value);
+  if (/^https?:\/\/(?:localhost|127\.0\.0\.1)(?::\d+)?(?=[/?#]|$)/i.test(v)) {
+    let u;
+    try { u = new URL(v); } catch { return null; }
+    v = (u.pathname + u.search + u.hash) || '/';
+  }
+  return shareRef(v, mountPath);
+}
+
+function soleVisiblePortShare(wantPublic) {
+  let found = null;
+  for (const m of config.mounts) {
+    if (m.kind !== 'port' || !m.port) continue;
+    if (wantPublic ? m.public !== true : m.lan === false) continue;
+    if (found) return null;         // two apps in play: nobody owns stray paths
+    found = m;
+  }
+  return found;
+}
+
+function proxyTargetPath(url, upstreamBase) {
+  let pathname;
+  if (!upstreamBase) pathname = url.pathname;
+  else if (url.pathname === upstreamBase) pathname = '/';
+  else if (url.pathname.startsWith(upstreamBase + '/')) pathname = url.pathname.slice(upstreamBase.length);
+  else pathname = '/';
   const search = new URLSearchParams(url.searchParams);
   search.delete('pin');
   const q = search.toString();
-  return rest + (q ? `?${q}` : '');
+  return pathname + (q ? `?${q}` : '');
 }
 
-function proxyPort(req, reply, mount, url) {
+function proxyResponseHeaders(uRes, mount) {
+  const hs = uRes.rawHeaders;
+  const pairs = [];
+  for (let i = 0; i < hs.length; i += 2) {
+    const name = hs[i].toLowerCase();
+    if (HOP_SKIP_RES.has(name)) continue;
+    let value = hs[i + 1];
+    if (name === 'location') {
+      const lv = proxyLocation(value, mount.path);
+      if (lv != null) value = lv;
+    } else if (name === 'set-cookie') {
+      value = scopeCookiePath(value, mount.path);
+    }
+    pairs.push(name, value);
+  }
+  return pairs;
+}
+
+function pipeUpstream(uRes, res, mount) {
+  try {
+    res.writeHead(uRes.statusCode || 502, proxyResponseHeaders(uRes, mount));
+    res.on('error', () => { try { uRes.destroy(); } catch { /* ignore */ } });
+    uRes.pipe(res);
+  } catch {
+    try { uRes.destroy(); } catch { /* ignore */ }
+    try { res.destroy(); } catch { /* ignore */ }
+  }
+}
+
+/* exact-size read; null when the stream ended short or overflowed */
+function drainUpstream(uRes, size) {
+  return new Promise((resolve) => {
+    const chunks = [];
+    let got = 0;
+    let done = false;
+    const finish = (v) => { if (!done) { done = true; resolve(v); } };
+    uRes.on('data', (c) => {
+      if (done) return;
+      got += c.length;
+      if (got > size) { finish(null); uRes.destroy(); return; }
+      chunks.push(c);
+      if (got >= size) { finish(Buffer.concat(chunks)); uRes.pause(); }
+    });
+    uRes.on('end', () => { if (!done) finish(got === size ? Buffer.concat(chunks) : null); });
+    uRes.on('error', () => { if (!done) finish(null); });
+  });
+}
+
+/*
+ * Response body: rewrite complete, uncompressed, reasonably small HTML/CSS
+ * pages; everything else (streams, compressed bodies, redirects to absolute
+ * off-host URLs…) is forwarded byte for byte. Redirects always pass through —
+ * their Location header is already fixed up by proxyResponseHeaders().
+ * Responses to HEAD never get rewritten: no body arrives on the wire, so
+ * their "content-length" is metadata, not bytes that will stream through.
+ */
+function sendUpstreamBody(uRes, res, mount, noResponseBody) {
+  if (res.writableEnded || res.destroyed || res.socket == null) { uRes.destroy(); return; }
+  const ctype = String(uRes.headers['content-type'] || '');
+  const size = parseInt(uRes.headers['content-length'] || '', 10);
+  const rewriteable = !noResponseBody
+    && !uRes.headers['content-encoding']
+    && Number.isInteger(size) && size >= 0 && size <= REWRITE_LIMIT
+    && REWRITEABLE_TYPE.test(ctype)
+    && !(uRes.statusCode >= 300 && uRes.statusCode < 400);
+
+  if (!rewriteable) return pipeUpstream(uRes, res, mount);
+
+  (async () => {
+    try {
+      const body = await drainUpstream(uRes, size);
+      if (body == null) { uRes.destroy(); try { res.destroy(); } catch { /* ignore */ } return; }
+      const isCss = /^\s*text\/css\b/i.test(ctype);
+      const text = isCss ? rewriteCssText(body.toString('utf8'), mount.path)
+        : rewriteHtmlDoc(body.toString('utf8'), mount.path);
+      const out = Buffer.from(text, 'utf8');
+
+      // the body we send is not the body the upstream described
+      const pairs = proxyResponseHeaders(uRes, mount);
+      const final = [];
+      for (let i = 0; i < pairs.length; i += 2) {
+        const name = pairs[i];
+        if (name === 'content-length' || name === 'etag') continue;
+        final.push(name, pairs[i + 1]);
+      }
+      final.push('content-length', String(out.length));
+
+      res.writeHead(uRes.statusCode || 502, final);
+      res.on('error', () => { try { uRes.destroy(); } catch { /* ignore */ } });
+      res.end(out);
+    } catch {
+      try { uRes.destroy(); } catch { /* ignore */ }
+      try { res.destroy(); } catch { /* ignore */ }
+    }
+  })();
+}
+
+function proxyPort(req, reply, mount, url, upstreamBase = mount.path) {
   const raw = req.raw;
   const res = reply.raw;
   reply.hijack();
@@ -1616,7 +1871,7 @@ function proxyPort(req, reply, mount, url) {
   }
   headers.host = `127.0.0.1:${mount.port}`;
   headers['x-forwarded-host'] = String(raw.headers.host || '');
-  headers['x-forwarded-prefix'] = mount.path;
+  headers['x-forwarded-prefix'] = upstreamBase;   // public path the app lives under
   headers['x-forwarded-proto'] = 'http';
   headers['x-forwarded-for'] = req.ctx.ip || '?';
 
@@ -1624,6 +1879,8 @@ function proxyPort(req, reply, mount, url) {
     try {
       // request body: Fastify holds the exact bytes — forward them untouched
       let buf = null;
+      // HEAD responses carry metadata only — no body will stream back
+      const noResponseBody = (raw.method || 'GET').toUpperCase() === 'HEAD';
       if (!NOT_BODY_METHODS.has((raw.method || 'GET').toUpperCase())) {
         if (req.body != null) buf = Buffer.isBuffer(req.body) ? req.body : Buffer.from(String(req.body));
         else {
@@ -1638,31 +1895,11 @@ function proxyPort(req, reply, mount, url) {
       const up = http.request({
         host: '127.0.0.1',
         port: mount.port,
-        path: proxyTargetPath(url, mount),
+        path: proxyTargetPath(url, upstreamBase),
         method: raw.method,
         headers,
         agent: false, // one fresh upstream connection per visitor request
-      }, (uRes) => {
-        // the visitor may be gone by now — never fight a closed socket
-        if (res.writableEnded || res.destroyed || res.socket == null) { uRes.destroy(); return; }
-        try {
-          const flat = [];
-          const hs = uRes.rawHeaders;
-          for (let i = 0; i < hs.length; i += 2) {
-            const name = hs[i].toLowerCase();
-            if (HOP_SKIP_RES.has(name)) continue;
-            let value = hs[i + 1];
-            if (name === 'location' && String(value).startsWith('/')) value = mount.path + value;
-            flat.push(name, value);
-          }
-          res.writeHead(uRes.statusCode || 502, flat);
-          res.on('error', () => uRes.destroy());
-          uRes.pipe(res);
-        } catch {
-          try { uRes.destroy(); } catch { /* ignore */ }
-          try { res.destroy(); } catch { /* ignore */ }
-        }
-      });
+      }, (uRes) => sendUpstreamBody(uRes, res, mount, noResponseBody));
       up.on('error', () => {
         if (res.headersSent || res.destroyed) { try { res.destroy(); } catch { /* ignore */ } return; }
         res.writeHead(502, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
@@ -1850,8 +2087,8 @@ async function boot() {
     lines.push('  (no LAN IP found — Wi-Fi sharing unavailable)');
   }
   lines.push('  Share folders by opening the admin page and adding them.');
-  lines.push('  Shares can ask guests for a 6-digit PIN once, expose an app that runs on');
-  lines.push('  this computer (a local port), or send guests straight to a shared link.');
+  lines.push('  Shares can ask guests for a 6-digit PIN once, or expose an app that');
+  lines.push('  runs on this computer (a local port).');
   lines.push(`  Admin token (only needed to manage from another device): ${config.adminToken}`);
   lines.push('  Tip: if Windows asks about the firewall, allow Node.js on private networks.');
   console.log(lines.join('\n'));

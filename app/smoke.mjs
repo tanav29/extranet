@@ -5,7 +5,24 @@ import { fileURLToPath } from "node:url";
 import { pathToFileURL } from "node:url";
 
 const base = path.dirname(fileURLToPath(import.meta.url)); // app/
-const pub = path.resolve(base, "..", "public", "app", "assets");
+const pub = path.resolve(base, "dist", "assets");
+
+/* the running server's port: EXTRANET_PORT, data/config.json, else the default */
+function serverOrigin() {
+  if (process.env.EXTRANET_PORT) return `http://localhost:${process.env.EXTRANET_PORT}`;
+  try {
+    const cfgRoot = path.resolve(base, "..", "data");       // repo layout
+    const cfgHome = path.join(process.env.USERPROFILE || process.env.HOME || "", ".extranet", "data");
+    for (const dir of [cfgRoot, cfgHome]) {
+      try {
+        const cfg = JSON.parse(fs.readFileSync(path.join(dir, "config.json"), "utf8"));
+        if (cfg.httpPort) return `http://localhost:${cfg.httpPort}`;
+      } catch { /* try the next one */ }
+    }
+  } catch { /* default below */ }
+  return "http://localhost:5050";
+}
+const ORIGIN = serverOrigin();
 
 function entryChunk(prefix) {
   const files = fs.readdirSync(pub).filter((f) => f.startsWith(prefix + "-") && f.endsWith(".js"));
@@ -48,10 +65,10 @@ async function boot(url, prefix, checks) {
 }
 
 const results = [];
-results.push(["home", await boot("http://localhost:5050/", "home", ["Hi 👋", "Shared on this computer", "read-only"])]);
-results.push(["admin", await boot("http://localhost:5050/admin", "admin", ["This network", "Shared folders", "Internet link", "Analytics"])]);
-results.push(["analytics", await boot("http://localhost:5050/analytics", "analytics", ["Analytics", "Request log", "Clients"])]);
-results.push(["browse", await boot("http://localhost:5050/movies/", "browse", ["Download all", "items"])]);
+results.push(["home", await boot(`${ORIGIN}/`, "home", ["Hi 👋", "Shared on this computer", "read-only"])]);
+results.push(["admin", await boot(`${ORIGIN}/admin`, "admin", ["This network", "Shared folders", "Internet link", "Analytics"])]);
+results.push(["analytics", await boot(`${ORIGIN}/analytics`, "analytics", ["Analytics", "Request log", "Clients"])]);
+results.push(["browse", await boot(`${ORIGIN}/movies/`, "browse", ["Download all", "items"])]);
 
 let fail = false;
 for (const [name, r] of results) {

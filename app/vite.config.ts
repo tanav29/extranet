@@ -5,7 +5,7 @@ import path from "node:path";
 
 /* The running Fastify server (npx extranet / npm start at the repo root). Used both as a dev
  * proxy so the admin/analytics pages work with hot reload, and as the host of
- * the finished bundle in public/app. */
+ * the finished bundle in app/dist. */
 const backend = process.env.VITE_BACKEND || "http://localhost:5050";
 
 export default defineConfig({
@@ -17,14 +17,12 @@ export default defineConfig({
      * server while everything else is served by Vite itself. */
     proxy: {
       "^/admin/(?:api|qr)(?:$|/)": { target: backend, changeOrigin: true },
-      "^/fonts.css$": { target: backend, changeOrigin: true },
-      "^/fonts/": { target: backend, changeOrigin: true },
       "^/favicon.ico$": { target: backend, changeOrigin: true },
       "^/robots.txt$": { target: backend, changeOrigin: true },
     },
   },
   build: {
-    outDir: "../public/app",
+    outDir: "dist",
     emptyOutDir: true,
     rollupOptions: {
       input: {

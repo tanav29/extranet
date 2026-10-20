@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   AlertTriangle, Cable, Copy, Download, ExternalLink, Folder, FolderOpen, Globe,
-  Info, KeyRound, Link2, LoaderCircle, Monitor, Pencil, Plus, QrCode, Search, ShieldBan,
+  Info, KeyRound, LoaderCircle, Monitor, Pencil, Plus, QrCode, Search, ShieldBan,
   Trash2, Wifi,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -19,7 +19,7 @@ import {
 import { cn } from "@/lib/utils";
 
 type State = any;
-type MountKind = "folder" | "port" | "url";
+type MountKind = "folder" | "port";
 
 export default function AdminApp() {
   const [state, setState] = useState<State | null>(null);
@@ -107,7 +107,7 @@ function PageTop({ state }: { state: State }) {
     <div className="mb-5 flex flex-wrap items-end gap-x-4 gap-y-3">
       <div>
         <h1 className="text-[15.5px] font-semibold tracking-tight">Console</h1>
-        <p className="mt-0.5 text-[12px] text-muted-foreground">Share folders, app ports and links from this computer.</p>
+        <p className="mt-0.5 text-[12px] text-muted-foreground">Share folders and app ports from this computer.</p>
       </div>
       <div className="flex flex-1 flex-wrap items-center justify-end gap-1.5">
         <StatusChip icon={<FolderOpen />}>
@@ -138,21 +138,11 @@ function slugOf(dir: string): string {
   return "/" + base.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
 }
 
-/* suggest a share address from a pasted link: https://drive.google.com/… → /drive.google.com */
-function slugOfUrl(u: string): string {
-  try {
-    const host = new URL(/^https?:\/\//i.test(u.trim()) ? u.trim() : "https://" + u.trim()).hostname;
-    const sl = host.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
-    return sl ? "/" + sl : "";
-  } catch { return ""; }
-}
-
 function SharesCard({ state, refresh, onQR }: { state: State; refresh: () => Promise<any>; onQR: (sharePath: string, pin?: string | null) => void }) {
   const [addKind, setAddKind] = useState<MountKind>("folder");
   const [addPath, setAddPath] = useState("");
   const [addDir, setAddDir] = useState("");
   const [addPort, setAddPort] = useState("");
-  const [addUrl, setAddUrlState] = useState("");
   const [addPin, setAddPin] = useState("");
   const [nameTouched, setNameTouched] = useState(false);
   const [lan, setLan] = useState(true);
@@ -169,25 +159,16 @@ function SharesCard({ state, refresh, onQR }: { state: State; refresh: () => Pro
     setPickerOpen(false);
   }
 
-  function setUrl(u: string) {
-    setAddUrlState(u);
-    if (!nameTouched) setAddPath(slugOfUrl(u));
-  }
-
   function switchKind(k: MountKind) {
     setAddKind(k);
     // re-suggest the address from whatever the user has typed so far
-    if (!nameTouched) {
-      if (k === "folder") setAddPath(addDir ? slugOf(addDir) : "");
-      if (k === "url") setAddPath(addUrl ? slugOfUrl(addUrl) : "");
-    }
+    if (!nameTouched && k === "folder") setAddPath(addDir ? slugOf(addDir) : "");
   }
 
   async function add() {
     if (!addPath.trim()) { toast.error("Pick a web address first"); return; }
     if (addKind === "folder" && !addDir.trim()) { toast.error("Pick a folder first"); return; }
     if (addKind === "port" && addPort.trim() === "") { toast.error("Which port should this address forward to?"); return; }
-    if (addKind === "url" && !addUrl.trim()) { toast.error("Paste the link first"); return; }
     setBusy(true);
     try {
       const body: any = {
@@ -198,17 +179,14 @@ function SharesCard({ state, refresh, onQR }: { state: State; refresh: () => Pro
       };
       if (addKind === "folder") body.dir = addDir;
       if (addKind === "port") body.port = parseInt(addPort, 10);
-      if (addKind === "url") body.url = addUrl.trim();
       if (addPin.trim()) body.pin = addPin.replace(/[^\d]/g, "");
       await api("/admin/api/mounts", { method: "POST", body });
-      setAddDir(""); setAddPath(""); setAddPort(""); setAddUrlState(""); setAddPin("");
+      setAddDir(""); setAddPath(""); setAddPort(""); setAddPin("");
       setNameTouched(false);
       await refresh();
       toast.success(addKind === "port"
         ? `Shared ${addPath} — forwards to port ${addPort}`
-        : addKind === "url"
-          ? `Shared ${addPath} — opens ${addUrl}`
-          : `Shared at ${addPath}`);
+        : `Shared at ${addPath}`);
     } catch (e: any) {
       toast.error(e.message);
     } finally {
@@ -229,7 +207,7 @@ function SharesCard({ state, refresh, onQR }: { state: State; refresh: () => Pro
           <div>
             <div className="text-[13px] font-medium">Nothing shared yet</div>
             <div className="mt-0.5 text-[11.5px] text-muted-foreground">
-              Add folder, port or link shares below — guests browse folders or follow the links.
+              Add folder or app-port shares below — guests browse the folders or open the apps.
             </div>
           </div>
         </div>
@@ -245,9 +223,7 @@ function SharesCard({ state, refresh, onQR }: { state: State; refresh: () => Pro
           <span className="ml-1 font-normal">
             {addKind === "folder"
               ? "— a folder from this computer"
-              : addKind === "url"
-                ? "— a link from the web"
-                : "— an app running on this computer"}
+              : "— an app running on this computer"}
           </span>
         </div>
 
@@ -260,14 +236,7 @@ function SharesCard({ state, refresh, onQR }: { state: State; refresh: () => Pro
               value={addPath}
               onChange={(e) => { setAddPath(e.target.value); setNameTouched(true); }}
             />
-            {addKind === "url" ? (
-              <Input
-                className="min-w-40 flex-1 font-mono text-xs"
-                placeholder="https://… the link guests should open"
-                value={addUrl}
-                onChange={(e) => setUrl(e.target.value)}
-              />
-            ) : addKind === "folder" ? (
+            {addKind === "folder" ? (
               <>
                 <Input
                   className="min-w-40 flex-1 font-mono text-xs"
@@ -320,10 +289,8 @@ function SharesCard({ state, refresh, onQR }: { state: State; refresh: () => Pro
           </div>
           <p className="text-[11px] leading-relaxed text-muted-foreground">
             {addKind === "port"
-              ? "Every request under the address is forwarded to that port on this computer (plain HTTP, no websockets)."
-              : addKind === "url"
-                ? "Guests who open the address are sent straight to the link — handy for sharing a page, a doc or a download."
-                : "The web address is the path guests see, like /photos. Keep it short and simple."}
+              ? "Every request under the address is forwarded to that local port (plain HTTP, no websockets). Apps with absolute paths keep working — asset URLs are repointed under the share."
+              : "The web address is the path guests see, like /photos. Keep it short and simple."}
           </p>
         </div>
       </div>
@@ -360,7 +327,6 @@ function KindPick({ value, onChange }: { value: MountKind; onChange: (v: MountKi
     <div className="flex items-center rounded-md border p-0.5">
       {opt("folder", <Folder className="size-3.5" />, "Folder")}
       {opt("port", <Cable className="size-3.5" />, "App port")}
-      {opt("url", <Link2 className="size-3.5" />, "Link")}
     </div>
   );
 }
@@ -402,15 +368,13 @@ function ShareRow({ m, state, refresh, onQR }: { m: any; state: State; refresh: 
   return (
     <div className="group flex flex-wrap items-center gap-x-3 gap-y-1.5 border-b px-4 py-2.5 transition-colors last:border-b-0 hover:bg-muted/40">
       <span className="grid size-8 shrink-0 place-items-center rounded-md border bg-muted/50 text-muted-foreground">
-        {m.kind === "port" ? <Cable className="size-4" /> : m.kind === "url" ? <Link2 className="size-4" /> : <Folder className="size-4 text-zinc-500" />}
+        {m.kind === "port" ? <Cable className="size-4" /> : <Folder className="size-4 text-zinc-500" />}
       </span>
       <div className="min-w-40 flex-1">
         <div className="flex items-center gap-1.5">
           <a href={shareUrl()} target="_blank" rel="noopener" className="truncate font-mono text-[12.5px] hover:underline">{m.path}/</a>
           {m.kind === "port" ? (
             <Badge variant="secondary" className="gap-1 font-normal"><Cable className="size-3" />:{m.port}</Badge>
-          ) : m.kind === "url" ? (
-            <Badge variant="secondary" className="gap-1 font-normal"><Link2 className="size-3" />link</Badge>
           ) : null}
           {m.pin ? (
             <Badge variant="secondary" className="gap-1 font-normal"><KeyRound className="size-3" />PIN</Badge>
@@ -418,9 +382,9 @@ function ShareRow({ m, state, refresh, onQR }: { m: any; state: State; refresh: 
         </div>
         <div
           className="truncate font-mono text-[11px] text-muted-foreground"
-          title={m.kind === "port" ? `127.0.0.1:${m.port}` : m.kind === "url" ? m.url : m.dir}
+          title={m.kind === "port" ? `127.0.0.1:${m.port}` : m.dir}
         >
-          {m.kind === "port" ? `→ 127.0.0.1:${m.port}` : m.kind === "url" && m.url ? `→ ${m.url}` : m.dir}
+          {m.kind === "port" ? `→ 127.0.0.1:${m.port}` : m.dir}
         </div>
       </div>
       <ScopeSwitches lan={lan} pub={pub} onLan={(v) => patch({ lan: v })} onPub={(v) => patch({ public: v })} />
@@ -428,7 +392,7 @@ function ShareRow({ m, state, refresh, onQR }: { m: any; state: State; refresh: 
         <IconBtn title="Copy link (includes the PIN when set)" onClick={() => copyText(shareUrl()).then(() => toast.success("Link copied"))}><Copy /></IconBtn>
         <IconBtn title="Show QR" onClick={() => onQR(m.path, m.pin)}><QrCode /></IconBtn>
         <IconBtn
-          title={m.kind === "url" ? "Edit address, link and PIN" : m.kind === "port" ? "Edit address, port and PIN" : "Edit address and PIN"}
+          title={m.kind === "port" ? "Edit address, port and PIN" : "Edit address and PIN"}
           onClick={() => setEditOpen(true)}
         ><Pencil /></IconBtn>
         <IconBtn title="Open in browser" asChild>
@@ -455,7 +419,6 @@ function ShareEditDialog({
 }: { open: boolean; onOpenChange: (o: boolean) => void; m: any; onDone: () => Promise<any> }) {
   const [path, setPath] = useState(m.path);
   const [port, setPort] = useState(String(m.port || ""));
-  const [url, setUrl] = useState(m.url || "");
   const [pin, setPin] = useState(m.pin || "");
   const [busy, setBusy] = useState(false);
 
@@ -463,7 +426,6 @@ function ShareEditDialog({
     if (!open) return;
     setPath(m.path);
     setPort(String(m.port || ""));
-    setUrl(m.url || "");
     setPin(m.pin || "");
   }, [open, m]);
 
@@ -472,7 +434,6 @@ function ShareEditDialog({
     try {
       const body: any = { path, pin };
       if (m.kind === "port") body.port = parseInt(port, 10);
-      else if (m.kind === "url") body.url = url.trim();
       else body.dir = m.dir;
       await api(`/admin/api/mounts/${m.id}`, { method: "PATCH", body });
       onOpenChange(false);
@@ -494,9 +455,7 @@ function ShareEditDialog({
           <DialogDescription>
             {m.kind === "port"
               ? "Forwards everything under this address to a local port on this computer."
-              : m.kind === "url"
-                ? "Sends guests who open this address straight to the link."
-                : "The address guests open, and the PIN they must enter once."}
+              : "The address guests open, and the PIN they must enter once."}
           </DialogDescription>
         </DialogHeader>
         <div className="grid gap-2.5">
@@ -510,15 +469,6 @@ function ShareEditDialog({
               <Input
                 type="number" min={1024} max={65535}
                 className="font-mono text-xs" value={port} onChange={(e) => setPort(e.target.value)}
-              />
-            </label>
-          )}
-          {m.kind === "url" && (
-            <label className="grid gap-1 text-[11.5px] font-medium text-muted-foreground">
-              Link to open
-              <Input
-                className="font-mono text-xs" placeholder="https://example.com/page"
-                value={url} onChange={(e) => setUrl(e.target.value)}
               />
             </label>
           )}

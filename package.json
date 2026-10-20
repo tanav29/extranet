@@ -1,7 +1,7 @@
 {
   "name": "extranet",
   "version": "1.0.0",
-  "description": "Share folders from this computer over Wi-Fi or the internet, with a dead-simple viewer for guests.",
+  "description": "Share folders and app ports from this computer over Wi-Fi or the internet, with a dead-simple viewer for guests.",
   "license": "MIT",
   "main": "server/index.js",
   "bin": {
@@ -10,7 +10,7 @@
   "files": [
     "bin/",
     "server/",
-    "public/",
+    "app/dist/",
     "README.md"
   ],
   "scripts": {
@@ -18,6 +18,7 @@
     "setup": "npm --prefix app install",
     "dev": "npm --prefix app run dev",
     "build": "npm --prefix app run build",
+    "prepublishOnly": "npm run build",
     "smoke": "node app/smoke.mjs"
   },
   "engines": {
