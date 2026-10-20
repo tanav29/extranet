@@ -31,6 +31,7 @@ export default defineConfig({
         admin: path.resolve(__dirname, "admin.html"),
         browse: path.resolve(__dirname, "browse.html"),
         analytics: path.resolve(__dirname, "analytics.html"),
+        home: path.resolve(__dirname, "home.html"),
       },
     },
   },

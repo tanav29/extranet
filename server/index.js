@@ -7,7 +7,8 @@
  *  - Can also expose a port of this computer under a URL path (/webapp → 127.0.0.1:3000)
  *  - Shares can be locked with a 6-digit PIN; guests enter it once (cookie) or pass it in the URL (?pin=123456)
  *  - The React app in app/ compiles into public/app and is served statically:
- *    admin console (/admin), guest browser (any share path), analytics (/analytics)
+ *    admin console (/admin), guest browser (any share path), analytics (/analytics),
+ *    and a guest start page (/): directory of visible shares + host facts
  *  - LAN over HTTP, plus a Cloudflare quick-tunnel for internet access
  *  - Admin console at /admin (this machine only, or with a token)
  *
@@ -23,6 +24,7 @@ const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 const zlib = require('zlib');
+const dns = require('dns');
 const { spawn, spawnSync } = require('child_process');
 const Fastify = require('fastify');
 
@@ -741,6 +743,154 @@ function stopTunnel() {
 }
 
 /* ------------------------------------------------------------------ */
+/* Machine facts for the start page (/)                                */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The guest directory shows little live chips about the host machine:
+ * battery level, whether the host itself has internet, and its primary
+ * network address. Guests' browsers can't read those — they're read here
+ * with platform-native helpers and cached, re-checked once a minute.
+ */
+const sys = { battery: null, internet: null, busy: false };
+
+function runTool(bin, args, timeoutMs) {
+  return new Promise((resolve) => {
+    let child;
+    try { child = spawn(bin, args, { windowsHide: true }); } catch { return resolve(null); }
+    let out = '';
+    const timer = setTimeout(() => { try { child.kill(); } catch { /* gone */ } }, timeoutMs);
+    child.stdout.on('data', (c) => { if (out.length < 8192) out += c; });
+    child.on('error', () => { clearTimeout(timer); resolve(null); });
+    child.on('close', () => { clearTimeout(timer); resolve(out); });
+  });
+}
+
+/* Windows: .NET's SystemInformation.PowerStatus in one PowerShell line.
+ * Sent base64-UTF16LE ("EncodedCommand") so no shell quoting can bite. */
+function batteryFromPowershell() {
+  const script =
+    'Add-Type -AssemblyName System.Windows.Forms;' +
+    '$p = [System.Windows.Forms.SystemInformation]::PowerStatus;' +
+    '@{ hasBattery = -not ($p.BatteryChargeStatus -band [System.Windows.Forms.BatteryChargeStatus]::NoSystemBattery); ' +
+    'level = [Math]::Round($p.BatteryLifePercent * 100); ' +
+    'online = ($p.PowerLineStatus -eq [System.Windows.Forms.PowerLineStatus]::Online) } | ConvertTo-Json -Compress';
+  return runTool('powershell', ['-NoProfile', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], 8000);
+}
+
+/* macOS: pmset prints e.g. "54%; discharging; ..." or "100%; charged;" */
+async function batteryFromPmset() {
+  const out = await runTool('pmset', ['-g', 'batt'], 6000);
+  if (!out || /no batteries available/i.test(String(out))) return null;
+  const m = /\b(\d+)%;\s*([a-z-]+);/.exec(String(out)) || /\b(\d+)%/.exec(String(out));
+  if (!m) return null;
+  const level = parseInt(m[1], 10);
+  if (!(level >= 0 && level <= 100)) return null;
+  const state = (m[2] || '').toLowerCase();
+  const ac = /'AC Power'/.test(out);
+  return { present: true, level, charging: state === 'charging', ac };
+}
+
+/* Linux: /sys/class/power_supply — a BAT* entry holds capacity + status, mains
+ * adapters live in the sibling entries */
+async function batteryFromSysfs() {
+  let names = [];
+  try { names = await fsp.readdir('/sys/class/power_supply'); } catch { return null; }
+  const bat = names.find((n) => /^BAT/i.test(n));
+  if (!bat) return null;
+  let level = null, status = '';
+  try { level = parseInt((await fsp.readFile(`/sys/class/power_supply/${bat}/capacity`, 'utf8')).trim(), 10); } catch { /* gone */ }
+  try { status = (await fsp.readFile(`/sys/class/power_supply/${bat}/status`, 'utf8')).trim().toLowerCase(); } catch { /* gone */ }
+  if (!(level >= 0 && level <= 100)) return null;
+  let ac = false;
+  for (const n of names) {
+    if (/^BAT/i.test(n)) continue;
+    try {
+      const t = (await fsp.readFile(`/sys/class/power_supply/${n}/type`, 'utf8')).trim().toLowerCase();
+      if (t === 'mains') { ac = true; break; }
+    } catch { /* not a mains entry */ }
+  }
+  return { present: true, level, charging: status === 'charging', ac };
+}
+
+async function readBattery() {
+  try {
+    if (IS_WIN) {
+      let d = null;
+      const out = await batteryFromPowershell();
+      try { d = JSON.parse(String(out).trim()); } catch { /* unreadable */ }
+      if (!d || d.hasBattery !== true) return null;
+      const level = Math.round(Number(d.level));
+      if (!(level >= 0 && level <= 100)) return null;
+      return { present: true, level, charging: d.online === true && level < 100, ac: d.online === true };
+    }
+    if (process.platform === 'darwin') return await batteryFromPmset();
+    return await batteryFromSysfs();
+  } catch { return null; }
+}
+
+/* one cheap OS resolver hit — "does this machine itself reach the internet" */
+function checkInternet() {
+  return new Promise((resolve) => {
+    try {
+      dns.lookup('one.one.one.one', { timeout: 4000 }, (err, address) => resolve(!err && !!address));
+    } catch { resolve(false); }
+  });
+}
+
+async function refreshSys() {
+  if (sys.busy) return;
+  sys.busy = true;
+  try {
+    const [battery, internet] = await Promise.all([readBattery(), checkInternet()]);
+    sys.battery = battery;
+    sys.internet = internet;
+  } catch { /* next tick */ } finally { sys.busy = false; }
+}
+
+function startSysTicker() {
+  const tick = () => refreshSys();
+  setTimeout(tick, 300);               // warm up just after boot
+  const iv = setInterval(tick, 60 * 1000);
+  if (iv.unref) iv.unref();
+}
+
+/* the / payload — shares filtered to what this visitor may see, exactly like
+ * the share URLs themselves, plus the host facts above */
+function directoryState(ctx) {
+  const shares = config.mounts
+    .filter((m) => {
+      if (ctx.isTunnel) return m.public === true;   // internet link guests: internet-marked shares only
+      if (ctx.local) return true;                    // the owner sees every share
+      return m.lan !== false;                        // Wi-Fi guests: Wi-Fi-marked shares only
+    })
+    .map((m) => {
+      const out = { path: m.path, kind: m.kind === 'port' ? 'app' : 'folder', pin: !!m.pin };
+      if (ctx.local) {
+        out.dir = m.dir || null;
+        out.port = m.port || null;
+        out.scope = m.public ? (m.lan !== false ? 'both' : 'internet') : 'lan';
+      }
+      return out;
+    });
+  const ips = lanIPs();
+  return {
+    name: os.hostname(),
+    platform: IS_WIN ? 'windows' : process.platform === 'darwin' ? 'mac' : 'linux',
+    battery: sys.battery,
+    // an outbound-internet fact only makes sense for visitors close by — inter-
+    // net-link guests got here over the internet already
+    internet: ctx.isTunnel ? null : sys.internet,
+    // primary network address belongs to the host's own network: withheld from
+    // internet-link visitors
+    connection: ctx.isTunnel ? null : (ips[0] || null),
+    shares,
+    local: ctx.local,
+    ...(ctx.local ? { tunnelLive: !!(tunnel.proc && tunnel.url) } : {}),
+  };
+}
+
+/* ------------------------------------------------------------------ */
 /* The Fastify app                                                     */
 /* ------------------------------------------------------------------ */
 
@@ -922,10 +1072,14 @@ async function analyticsRoute(req, reply) {
   return sendPage(reply, 'analytics.html');
 }
 
+/* The guest start page: every share visible to this visitor plus host facts
+ * (name, battery, connection). JSON for scripts/inspectors, React page for
+ * people. The admin console stays at /admin. */
 async function rootRoute(req, reply) {
-  const ctx = req.ctx;
-  if (!ctx.isTunnel) return reply.code(302).header('Location', '/admin').send();
-  return serveShare(req, reply); // the public link serves shares only
+  const url = new URL(req.raw.url || '/', 'http://internal');
+  const wantJSON = url.searchParams.get('json') === '1' || String(req.raw.headers.accept || '').includes('application/json');
+  if (wantJSON) return json(reply, 200, directoryState(req.ctx));
+  return sendPage(reply, 'home.html');
 }
 
 /* ------------------------------------------------------------------ */
@@ -1617,6 +1771,7 @@ async function startServers() {
 
 async function boot() {
   await startServers();
+  startSysTicker();
 
   const ips = lanIPs();
   const primary = ips[0] && ips[0].address;
@@ -1624,6 +1779,7 @@ async function boot() {
   lines.push('');
   lines.push('Extranet is running.');
   lines.push(`  Admin (this computer)     http://localhost:${servers.httpPort}/admin`);
+  lines.push(`  Start page (everyone)     http://localhost:${servers.httpPort}/  — directory of visible shares`);
   lines.push(`  Analytics (this computer) http://localhost:${servers.httpPort}/analytics  — logs, client IPs, blocking`);
   if (primary) {
     lines.push(`  On this Wi-Fi             http://${primary}:${servers.httpPort}/<share>`);

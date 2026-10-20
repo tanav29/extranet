@@ -48,6 +48,7 @@ async function boot(url, prefix, checks) {
 }
 
 const results = [];
+results.push(["home", await boot("http://localhost:5050/", "home", ["Hi 👋", "Shared on this computer", "read-only"])]);
 results.push(["admin", await boot("http://localhost:5050/admin", "admin", ["This network", "Shared folders", "Internet link", "Analytics"])]);
 results.push(["analytics", await boot("http://localhost:5050/analytics", "analytics", ["Analytics", "Request log", "Clients"])]);
 results.push(["browse", await boot("http://localhost:5050/movies/", "browse", ["Download all", "items"])]);

@@ -35,6 +35,16 @@ Useful flags: `npx . --port 6060`, `npx . --build` (rebuild the UI), `npx . --he
 
 ## What you get
 
+- **Start page (`/`)** — a public directory for guests: a "Hi 👋" hero with the
+  computer's name, live status chips (battery level pulled natively from the
+  OS — PowerShell `PowerStatus` on Windows, `pmset` on macOS, `/sys` on Linux —
+  re-checked every minute; primary network connection; whether the host itself
+  has internet), and a card for every share this visitor is allowed to see —
+  folders and app ports, with PIN and scope badges. The share list is filtered
+  per visitor: the owner sees everything, Wi-Fi guests see Wi-Fi shares,
+  internet-link guests see public shares only (and never the host's LAN
+  address). `/?json=1` (or an `Accept: application/json` request to `/`)
+  returns the same data as JSON. The admin console stays at `/admin`.
 - **Desktop-style UI** — a fixed sidebar + canvas app frame: the console puts
   the share list front and center with network and internet-link panels in a
   side rail; analytics is a two-pane view (request log ⇄ clients & blocking);
