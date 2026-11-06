@@ -1,3 +1,6 @@
+import type { Config, Share, Runtime, ServiceName } from './types';
+import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { Socket } from 'node:net';
 'use strict';
 /*
  * Shared bits for the four Extranet services (proxy, files, web, api).
@@ -14,17 +17,17 @@
  * Nothing here talks HTTP; each service owns its own listener.
  */
 
-const fs = require('fs');
+import * as fs from 'fs';
 const fsp = fs.promises;
-const path = require('path');
-const os = require('os');
-const crypto = require('crypto');
+import * as path from 'path';
+import * as os from 'os';
+import * as crypto from 'crypto';
 
 /* ------------------------------------------------------------------ */
 /* Paths                                                                */
 /* ------------------------------------------------------------------ */
 
-const ROOT = path.join(__dirname, '..');
+const ROOT = path.resolve(__dirname, '..', '..');
 const PUBLIC_DIR = process.env.EXTRANET_PUBLIC_DIR
   ? path.resolve(process.env.EXTRANET_PUBLIC_DIR)
   : path.join(ROOT, 'app', 'dist');
@@ -48,7 +51,7 @@ const DEFAULT_PORTS = {
   files: 8080,
 };
 
-function envPort(name) {
+function envPort(name: string) {
   const n = Number.parseInt(process.env[`EXTRANET_${name}_PORT`] || '', 10);
   return (Number.isInteger(n) && n >= 1024 && n <= 65535) ? n : null;
 }
@@ -63,7 +66,7 @@ const RESERVED_PREFIXES = [
 /* Config — the route registry                                          */
 /* ------------------------------------------------------------------ */
 
-function defaultConfig() {
+function defaultConfig(): Config {
   return {
     proxyPort: DEFAULT_PORTS.proxy,
     adminToken: crypto.randomBytes(6).toString('hex'),
@@ -73,11 +76,11 @@ function defaultConfig() {
   };
 }
 
-function normalizeRoute(m) {
+function normalizeRoute(m: Share) {
   m.kind = m.kind === 'port' ? 'port' : 'folder';
   m.lan = m.lan !== false;
   m.public = m.public === true;
-  delete m.url;                     // link routes are retired
+  delete (m as Share & { url?: string }).url;                     // link routes are retired
   if (m.kind === 'port') {
     const p = Number(m.port);
     m.port = (Number.isInteger(p) && p >= 1 && p <= 65535) ? p : null;
@@ -98,11 +101,8 @@ function readConfigFile(allowMissing = true) {
     if (!Array.isArray(loaded.routes) && Array.isArray(loaded.mounts)) loaded.routes = loaded.mounts;
     if (!Number.isInteger(loaded.proxyPort) && Number.isInteger(loaded.httpPort)) loaded.proxyPort = loaded.httpPort;
     Object.assign(cfg, loaded);
-    delete cfg.httpPort;
-    delete cfg.mounts;
-    delete cfg.httpsPort;
-    delete cfg.httpsEnabled;
-  } catch (err) {
+    for (const key of ['httpPort', 'mounts', 'httpsPort', 'httpsEnabled']) delete (cfg as unknown as Record<string, unknown>)[key];
+  } catch (caught) { const err = caught as NodeJS.ErrnoException;
     if (!allowMissing || err.code !== 'ENOENT') {
       throw new Error(`Cannot read ${CONFIG_FILE}: ${err.message}`);
     }
@@ -126,7 +126,7 @@ const config = readConfigFile();
 
 function refreshConfig() {
   const next = readConfigFile(false);
-  for (const k of Object.keys(config)) delete config[k];
+  for (const k of Object.keys(config)) delete (config as unknown as Record<string, unknown>)[k];
   Object.assign(config, next);
 }
 
@@ -136,11 +136,11 @@ function saveConfig() {
 
 /* watch a data file (config.json / runtime.json): mtime+size poll, re-read
  * on change. Cheap and reliable across processes on all platforms. */
-function watchFile(file, onChange) {
-  let last = null;
+function watchFile(file: string, onChange: () => void) {
+  let last: fs.Stats | null = null;
   try { last = fs.statSync(file); } catch { /* appears later */ }
   const iv = setInterval(() => {
-    let st = null;
+    let st: fs.Stats | null = null;
     try { st = fs.statSync(file); } catch { return; }   // gone: keep the last good copy
     if (last && st.mtimeMs === last.mtimeMs && st.size === last.size) return;
     last = st;
@@ -150,7 +150,7 @@ function watchFile(file, onChange) {
   return iv;
 }
 
-function startConfigWatch(onChange) {
+function startConfigWatch(onChange?: () => void) {
   watchFile(CONFIG_FILE, () => {
     try { refreshConfig(); onChange && onChange(); } catch { /* keep the last good copy */ }
   });
@@ -160,7 +160,7 @@ function startConfigWatch(onChange) {
 /* Runtime ports — who bound where                                      */
 /* ------------------------------------------------------------------ */
 
-function readRuntime() {
+function readRuntime(): Runtime {
   try {
     const d = JSON.parse(fs.readFileSync(RUNTIME_FILE, 'utf8'));
     return d && typeof d === 'object' ? d : {};
@@ -168,24 +168,24 @@ function readRuntime() {
 }
 
 // Unique staging files prevent collisions; rename exposes only complete JSON.
-function writeJsonAtomic(file, obj) {
+function writeJsonAtomic(file: string, obj: unknown) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
   try {
     fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), { flag: 'wx', mode: 0o600 });
     fs.renameSync(tmp, file);
   } finally {
-    try { fs.unlinkSync(tmp); } catch (err) { if (err.code !== 'ENOENT') throw err; }
+    try { fs.unlinkSync(tmp); } catch (caught) { const err = caught as NodeJS.ErrnoException; if (err.code !== 'ENOENT') throw err; }
   }
 }
 
-function writeRuntime(obj) {
+function writeRuntime(obj: Runtime) {
   writeJsonAtomic(RUNTIME_FILE, obj);
 }
 
 // Supervised children report readiness over IPC. Only the supervisor writes
 // runtime.json, so simultaneous binds cannot overwrite another service's port.
-function publishService(name, port) {
+function publishService(name: ServiceName, port: number) {
   if (typeof process.send === 'function') {
     process.send({ type: 'service-ready', name, port });
     return;
@@ -196,7 +196,7 @@ function publishService(name, port) {
   writeRuntime(cur);
 }
 
-function watchRuntime(onChange) {
+function watchRuntime(onChange: (runtime: Runtime) => void) {
   watchFile(RUNTIME_FILE, () => { try { onChange(readRuntime()); } catch { /* ignore */ } });
   onChange(readRuntime());
 }
@@ -205,17 +205,17 @@ function watchRuntime(onChange) {
 /* Small helpers                                                        */
 /* ------------------------------------------------------------------ */
 
-function escapeHTML(s) {
-  return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+function escapeHTML(s: unknown) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
 }
 
-function pageHTML(title, bodyHtml) {
+function pageHTML(title: string, bodyHtml: string) {
   return `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${escapeHTML(title)}</title><style>body{font:16px/1.6 system-ui,sans-serif;color:#1c1e21;display:grid;place-items:center;min-height:100vh;margin:0}main{max-width:34em;padding:2rem;text-align:center}h1{font-size:1.3rem;font-weight:600}p{color:#6b7280}</style><main>${bodyHtml}`;
 }
 
 /* raw-server response helpers (the proxy + hijacked replies all use these) */
-function sendRawHtml(res, status, title, bodyHtml) {
+function sendRawHtml(res: ServerResponse, status: number, title: string, bodyHtml: string) {
   try {
     res.writeHead(status, {
       'Content-Type': 'text/html; charset=utf-8',
@@ -226,24 +226,24 @@ function sendRawHtml(res, status, title, bodyHtml) {
   } catch { /* client gone */ }
 }
 
-function notFoundRaw(res, message) {
+function notFoundRaw(res: ServerResponse, message: string) {
   return sendRawHtml(res, 404, 'Nothing here', `<h1>Nothing here</h1><p>${escapeHTML(message)}</p>`);
 }
 
-function blockedRaw(res, ip) {
+function blockedRaw(res: ServerResponse, ip: string) {
   return sendRawHtml(res, 403, 'Blocked', `<h1>Blocked</h1>
 <p>The owner of this server has blocked this address.</p>
 <p style="font:12px monospace">${escapeHTML(ip || '')}</p>`);
 }
 
-function jsonRaw(res, status, obj) {
+function jsonRaw(res: ServerResponse, status: number, obj: unknown) {
   try {
     res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
     res.end(JSON.stringify(obj));
   } catch { /* client gone */ }
 }
 
-function timingSafeToken(got, want) {
+function timingSafeToken(got: unknown, want: unknown) {
   if (!got || !want) return false;
   const a = crypto.createHash('sha256').update(String(got)).digest();
   const b = crypto.createHash('sha256').update(String(want)).digest();
@@ -251,24 +251,24 @@ function timingSafeToken(got, want) {
 }
 
 /* keep PIN entries out of the access log & analytics */
-function obscurePinnedPath(u) {
+function obscurePinnedPath(u: string) {
   return String(u).replace(/(pin=)\d{6}/g, '$1\u2022\u2022\u2022\u2022\u2022\u2022');
 }
 
-function normIP(raw) {
+function normIP(raw: unknown) {
   let s = String(raw || '').trim();
   if (s.startsWith('::ffff:')) s = s.slice(7);
   return s || '?';
 }
 
-function isLocalSocket(sock) {
+function isLocalSocket(sock: Socket | null | undefined) {
   const a = sock && sock.remoteAddress;
   return a === '127.0.0.1' || a === '::1' || a === '::ffff:127.0.0.1';
 }
 
 function lanIPs() {
   const virtualHint = /wsl|hyper-|vethernet|vmware|virtualbox|loopback|docker|vpn/i;
-  const out = [];
+  const out: { name: string; address: string; score: number }[] = [];
   for (const [name, list] of Object.entries(os.networkInterfaces())) {
     for (const ni of list || []) {
       if (ni.family !== 'IPv4' || ni.internal) continue;
@@ -300,8 +300,8 @@ const HOP_SKIP_RES = new Set([
 const EDGE_HEADERS = new Set(['x-client-ip', 'x-client-kind', 'x-extranet-edge']);
 
 /* rawHeaders → flat [name, value, …] pairs with hop-by-hop entries dropped */
-function rawHeaderPairs(rawHeaders, skip) {
-  const pairs = [];
+function rawHeaderPairs(rawHeaders: string[], skip: Set<string>) {
+  const pairs: string[] = [];
   for (let i = 0; i < rawHeaders.length; i += 2) {
     const name = rawHeaders[i].toLowerCase();
     if (skip.has(name)) continue;
@@ -315,8 +315,8 @@ function rawHeaderPairs(rawHeaders, skip) {
 /* ------------------------------------------------------------------ */
 
 /* returns { segs: [...], trailing } or null for invalid ("..") */
-function parseSegments(rawPathname) {
-  const segs = [];
+function parseSegments(rawPathname: string) {
+  const segs: string[] = [];
   let trailing = false;
   for (const part of rawPathname.split('/')) {
     if (part === '') { if (rawPathname.endsWith('/') && segs.length) trailing = true; continue; }
@@ -329,7 +329,7 @@ function parseSegments(rawPathname) {
 }
 
 /* share address validation for the registry (admin API) */
-function normUrlPath(input) {
+function normUrlPath(input: unknown) {
   let p = String(input || '').trim().replace(/^\/+/, '');
   p = p.replace(/\/{2,}/g, '/').replace(/\/+$/, '');
   if (!p) return null;
@@ -338,7 +338,7 @@ function normUrlPath(input) {
   return '/' + segs.join('/');
 }
 
-function isReserved(p) {
+function isReserved(p: string) {
   return RESERVED_PREFIXES.some((r) => p === r || p.startsWith(r + '/'));
 }
 
@@ -346,7 +346,7 @@ function isReserved(p) {
 /* MIME + disposition (folder/file serving)                             */
 /* ------------------------------------------------------------------ */
 
-const MIME = {
+const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8', '.htm': 'text/html; charset=utf-8',
   '.txt': 'text/plain; charset=utf-8', '.md': 'text/plain; charset=utf-8', '.log': 'text/plain; charset=utf-8',
   '.csv': 'text/csv; charset=utf-8',
@@ -368,11 +368,11 @@ const MIME = {
   '.apk': 'application/vnd.android.package-archive',
 };
 
-function mimeFor(name) {
+function mimeFor(name: string) {
   return MIME[path.extname(name).toLowerCase()] || 'application/octet-stream';
 }
 
-function contentDisposition(kind, name) {
+function contentDisposition(kind: string, name: string) {
   const fallback = String(name).replace(/[^\x20-\x7E]/g, '_').replace(/["\\]/g, '_');
   return `${kind}; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(name)}`;
 }
@@ -385,15 +385,15 @@ function contentDisposition(kind, name) {
 const PIN_COOKIE_PREFIX = 'xpin-';
 const PIN_COOKIE_MAX_AGE = 60 * 60 * 24 * 180; // 180 days — enter the PIN once per device
 
-function pinCookieKey(id) {
+function pinCookieKey(id: string) {
   return PIN_COOKIE_PREFIX + String(id).replace(/[^a-zA-Z0-9-]/g, '');
 }
 
-function pinCookieValue(mount) {
+function pinCookieValue(mount: Share) {
   return crypto.createHash('sha256').update(`${mount.id}|${mount.pin}|${config.adminToken}`).digest('hex');
 }
 
-function pinCookieFromRequest(rawReq, mount) {
+function pinCookieFromRequest(rawReq: IncomingMessage, mount: Share) {
   const raw = String((rawReq.headers && rawReq.headers.cookie) || '');
   for (const pair of raw.split(';')) {
     const i = pair.indexOf('=');
@@ -403,7 +403,7 @@ function pinCookieFromRequest(rawReq, mount) {
   return null;
 }
 
-function setPinCookie(res, mount) {
+function setPinCookie(res: ServerResponse, mount: Share) {
   res.setHeader('Set-Cookie', `${pinCookieKey(mount.id)}=${pinCookieValue(mount)}; Path=/; Max-Age=${PIN_COOKIE_MAX_AGE}; HttpOnly; SameSite=Lax`);
 }
 
@@ -416,12 +416,12 @@ const PINS_LIMIT = 30;
 const PINS_COOLDOWN = 15 * 60 * 1000;
 const pinFailures = new Map(); // key "ip|mountId" -> { n, first, until }
 
-function pinThrottled(ip, mountId) {
+function pinThrottled(ip: string, mountId: string) {
   const e = pinFailures.get(`${ip}|${mountId}`);
   return !!(e && e.until > Date.now());
 }
 
-function pinNoteFailure(ip, mountId) {
+function pinNoteFailure(ip: string, mountId: string) {
   const key = `${ip}|${mountId}`;
   const now = Date.now();
   let e = pinFailures.get(key);
@@ -437,11 +437,11 @@ function pinNoteFailure(ip, mountId) {
   }
 }
 
-function pinClearFailure(ip, mountId) {
+function pinClearFailure(ip: string, mountId: string) {
   pinFailures.delete(`${ip}|${mountId}`);
 }
 
-function pinGateHtml(mountPath, opts) {
+function pinGateHtml(mountPath: string, opts?: { wrong?: boolean; cooldown?: boolean }) {
   const { wrong = false, cooldown = false } = opts || {};
   const msg = cooldown
     ? 'Too many wrong attempts. Wait a bit and try again.'
@@ -463,7 +463,7 @@ function pinGateHtml(mountPath, opts) {
  * when access may continue; false when a gate page (or the redirect that
  * consumes the entered PIN) has already been sent.
  */
-function enforceSharePinRaw(rawReq, res, mount, url, ip, isLocal) {
+function enforceSharePinRaw(rawReq: IncomingMessage, res: ServerResponse, mount: Share, url: URL, ip: string, isLocal: boolean) {
   if (!mount.pin || isLocal) return true;
 
   if (pinCookieValue(mount) === pinCookieFromRequest(rawReq, mount)) return true;
@@ -495,7 +495,7 @@ function enforceSharePinRaw(rawReq, res, mount, url, ip, isLocal) {
 /* Listening with a port bump                                           */
 /* ------------------------------------------------------------------ */
 
-function isAddrInUse(err) {
+function isAddrInUse(err: NodeJS.ErrnoException) {
   return !!err && (err.code === 'EADDRINUSE' || /address (already )?in use/i.test(String((err && err.message) || '')));
 }
 
@@ -503,20 +503,20 @@ function isAddrInUse(err) {
  * bind(port) → Promise must start listening or throw (EADDRINUSE moves to
  * the next port). Returns the port that worked.
  */
-async function bindWithBump(bind, basePort, tries = 20) {
+async function bindWithBump(bind: (port: number) => Promise<unknown>, basePort: number, tries = 20) {
   for (let i = 0; i < tries; i++) {
     const port = basePort + i;
     try {
       await bind(port);
       return port;
-    } catch (err) {
-      if (!isAddrInUse(err)) throw err;
+    } catch (caught) { const err = caught as NodeJS.ErrnoException;
+      if (!isAddrInUse(err as NodeJS.ErrnoException)) throw err;
     }
   }
   throw new Error(`no free port found from ${basePort}`);
 }
 
-module.exports = {
+export {
   ROOT, PUBLIC_DIR, DATA_DIR, CONFIG_FILE, RUNTIME_FILE, LOG_FILE, BIN_DIR,
   IS_WIN, TUNNEL_HOST_RE, DEFAULT_PORTS, envPort, RESERVED_PREFIXES,
   config, refreshConfig, saveConfig, startConfigWatch,

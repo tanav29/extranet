@@ -1,3 +1,4 @@
+import type { FastifyRequest, FastifyReply } from 'fastify';
 'use strict';
 /*
  * Extranet web service — serves the compiled UI (app/dist) on :3000.
@@ -14,14 +15,14 @@
  * directly on this computer.
  */
 
-const fs = require('fs');
-const path = require('path');
-const Fastify = require('fastify');
-const lib = require('./lib');
+import * as fs from 'fs';
+import * as path from 'path';
+import Fastify from 'fastify';
+import * as lib from './lib';
 
 const { PUBLIC_DIR, sendRawHtml } = lib;
 
-const APP_TYPES = {
+const APP_TYPES: Record<string, string> = {
   '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8',
   '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml',
   '.woff2': 'font/woff2', '.woff': 'font/woff',
@@ -29,7 +30,7 @@ const APP_TYPES = {
   '.html': 'text/html; charset=utf-8',
 };
 
-function appPage(name) {
+function appPage(name: string) {
   try { return fs.readFileSync(path.join(PUBLIC_DIR, name)); }
   catch {
     return Buffer.from(lib.pageHTML('UI not built', `<h1>UI not built</h1>
@@ -37,7 +38,7 @@ function appPage(name) {
   }
 }
 
-function sendPage(reply, name) {
+function sendPage(reply: FastifyReply, name: string) {
   return reply.code(200)
     .header('Content-Type', 'text/html; charset=utf-8')
     .header('Cache-Control', 'no-store')
@@ -45,12 +46,12 @@ function sendPage(reply, name) {
     .send(appPage(name));
 }
 
-function clientKind(req) {
+function clientKind(req: FastifyRequest) {
   const k = String(req.headers['x-client-kind'] || 'local');
   return ['local', 'lan', 'tunnel'].includes(k) ? k : 'lan';
 }
 
-function tunnelDenied(reply, title, message) {
+function tunnelDenied(reply: FastifyReply, title: string, message: string) {
   return sendRawHtml(reply.raw, 403, title, `<h1>Not available on the public link</h1><p>${lib.escapeHTML(message)}</p>`);
 }
 
@@ -85,7 +86,7 @@ app.all('/analytics', async (req, reply) => {
 app.all('/app', appAssetRoute);
 app.all('/app/*', appAssetRoute);
 
-async function appAssetRoute(req, reply) {
+async function appAssetRoute(req: FastifyRequest, reply: FastifyReply) {
   const { pathname } = new URL(req.raw.url || '/app', 'http://internal');
   if (req.raw.method !== 'GET' && req.raw.method !== 'HEAD') return reply.code(405).send();
   let rel;

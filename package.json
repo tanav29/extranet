@@ -3,25 +3,28 @@
   "version": "1.0.0",
   "description": "Share folders and app ports from this computer over Wi-Fi or the internet, with a dead-simple viewer for guests.",
   "license": "MIT",
-  "main": "server/index.js",
+  "main": "dist/server/index.js",
   "bin": {
-    "extranet": "bin/cli.js"
+    "extranet": "dist/bin/cli.js"
   },
   "files": [
-    "bin/",
-    "server/",
+    "dist/bin/",
+    "dist/server/",
     "app/dist/",
     "README.md"
   ],
   "scripts": {
-    "start": "node bin/cli.js",
-    "setup": "npm --prefix app install",
+    "start": "npm run build:server && node dist/bin/cli.js",
+    "setup": "npm ci && npm --prefix app ci",
     "dev": "npm --prefix app run dev",
-    "build": "npm --prefix app run build",
-    "prepublishOnly": "npm run build",
-    "smoke": "node app/smoke.mjs",
-    "test": "node --test test/*.test.js",
-    "typecheck": "npm --prefix app run typecheck"
+    "build": "npm run build:server && npm run build:ui",
+    "smoke": "npm run build:tools && node app/dist-tools/smoke.js",
+    "test": "npm run build:server && node --test dist/test/*.test.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit && npm --prefix app run typecheck && tsc -p app/tsconfig.tools.json --noEmit",
+    "build:server": "tsc -p tsconfig.json",
+    "build:ui": "npm --prefix app run build",
+    "prepack": "npm run build",
+    "build:tools": "tsc -p app/tsconfig.tools.json"
   },
   "engines": {
     "node": ">=20.17"
@@ -29,5 +32,10 @@
   "dependencies": {
     "fastify": "^5.12.7",
     "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "@types/qrcode": "^1.5.6",
+    "typescript": "^5.9.3"
   }
 }

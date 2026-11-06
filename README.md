@@ -1,278 +1,259 @@
 # Extranet
 
-Share folders and apps from your computer with the people around you — over
-your Wi-Fi, or with anyone anywhere through a Cloudflare link.
+Share folders and apps from your computer over Wi-Fi or through a temporary
+internet link. Guests use their browser; they do not need to install anything.
 
-Guests get a dead-simple page: browse folders, view photos / PDFs / video / text
-right in the browser, download anything (or a whole folder as a single
-`.zip`), and open an app that runs on this computer under a short address.
+Choose what to share, who can reach it, and whether to require a six-digit PIN.
+Guests can browse folders, preview photos, PDFs, video, audio, and text, download
+files, or download a folder as a ZIP. Copy a link or display a QR code to share.
+The admin console includes request history and controls for blocking guest IPs.
 
-```
-npx .          # from this repo
-npx extranet   # once the package is published to the npm registry
-```
+## Requirements
 
-Then open **http://localhost:8787/admin** on the same computer.
+- **Node.js 20.17 or newer**, with npm.
+- Windows, macOS, or Linux. Automated runtime checks have currently been run on Windows.
+- Permission to read the folders you share.
+- For Wi-Fi sharing, a network that allows your devices to communicate.
+- For public links, internet access and `cloudflared`. Wi-Fi sharing works without it.
 
-## How it runs — four services behind one proxy
+Your computer must stay awake and Extranet must keep running while guests use it.
 
-One small reverse proxy is the only public listener. It routes every URL path
-to four separate processes it supervises:
+## Get started
 
-```
- bin/cli.js ──► server/index.js  (supervisor)
-                 ├─► proxy   0.0.0.0:8787   the public edge — routes every path
-                 ├─► web    127.0.0.1:3000  app/dist UI: / /admin /analytics /app/*
-                 ├─► api    127.0.0.1:5000  /api/* registry, settings, tunnel, analytics
-                 └─► files  127.0.0.1:8080  /files/* folder shares, viewer, ZIPs
-```
+Use this setup from the repository. Availability of the `extranet` name on the
+npm registry is not assumed.
 
-- **The proxy is the only way in.** `web`, `api` and `files` bind `127.0.0.1`
-  only; the proxy listens on `0.0.0.0` and is the process the tunnel dials.
-  It is plain Node `http` (not Fastify) for speed and control.
-- **The services share no memory.** Cross-process state lives in `data/`:
-  the route registry in `config.json`, the actually-bound ports in
-  `runtime.json` (written only by the supervisor from child readiness messages), and the access log in
-  `logs.json` (owned by the proxy).
-- **The supervisor** (`server/index.js`) spawns the four, relays their output
-  with a `[name]` prefix, persists config before starting children, prints one banner once every current
-  child has reported its port, restarts crashed children (up to 10 attempts, 800 ms apart), and
-  tears everything down on Ctrl+C. Launched through `bin/cli.js`, so `npx`,
-  `npm start` and a symlinked global install all behave the same.
-- **The proxy tags every request** with `x-client-kind: local | lan | tunnel`,
-  and the pages and services use it to decide what a guest from where is
-  allowed to see.
-
-### Path routing
-
-| Path | Served by |
-|------|-----------|
-| `/` | web — the guest start page (its data comes from `/api/directory`) |
-| `/admin`, `/analytics` | web — console and analytics (403 on the tunnel) |
-| `/app/*` | web — the Vite bundle's assets |
-| `/api/*` | api — route registry, settings, tunnel control, blocklist, logs |
-| `/files/<name>/…` | files — folder share `<name>` |
-| `/<name>` — any other path | proxy — an app-port share pointing at a local port |
-| `/__ctl/*` | proxy-internal control (localhost + admin token only) |
-
-Dynamic route addresses may never claim the service prefixes: `/admin`,
-`/api`, `/files`, `/analytics`, `/app`, `/favicon.ico`, `/robots.txt`,
-`/__ctl`. Anything the registry doesn't resolve falls through to web's
-"Nothing here" page.
-
-## Project layout
-
-```
-bin/cli.js           the launcher — the only thing you run (npx / npm start)
-server/index.js      the supervisor: spawns, restarts and tears down the four
-server/proxy.js      the reverse proxy: route registry, rebind, logs, blocks
-server/web.js        the UI service (app/dist)
-server/api.js        the API service (/api/*)
-server/files.js      the folder-share service (/files/*)
-server/lib.js        shared code: config/runtime/log files, PIN gates
-app/                 the Vite + React + Tailwind source (admin, guest, analytics)
-app/dist/            the compiled UI the web service serves (gitignored)
-data/                runtime data: config.json, runtime.json, logs.json
+```sh
+git clone https://github.com/tanav29/extranet.git
+cd extranet
+npm run setup
+npm run build
+npm start
 ```
 
-Backend = four plain Node processes in `server/` (three Fastify apps + one
-`http` proxy). Frontend = one Vite app in `app/`, built into `app/dist/` —
-no server-side templating. Fonts load from Google Fonts at runtime, so no
-font files live in the repo. Runtime data lives in `data/` next to the repo;
-for an installed copy it moves to `~/.extranet/data`.
+`setup` installs locked backend and frontend dependencies. `build` compiles
+TypeScript and builds the UI. `start` compiles the backend and starts all services.
 
-Useful flags: `npx . --port 6060` (overrides the proxy port for one run),
-`npx . --build` (rebuild the UI), `npx . --help`.
+Open **http://localhost:8787/admin** on this computer. If that port is occupied,
+use the actual address printed in the terminal. On Windows, allow Node.js through
+the firewall on your private network when prompted. Keep the terminal open.
+Press **Ctrl+C** to stop Extranet.
 
-## What you get
+### Share a folder
 
-- **Start page (`/`)** — a public directory for guests: a "Hi 👋" hero with the
-  computer's name, live status chips (battery level pulled natively from the
-  OS — PowerShell `PowerStatus` on Windows, `pmset` on macOS, `/sys` on Linux —
-  re-checked every minute; primary network connection; whether the host itself
-  has internet), and a card for every share this visitor is allowed to see —
-  folders and app ports, with PIN and scope badges. The share list is
-  filtered per visitor: the owner sees everything, Wi-Fi guests see Wi-Fi
-  shares, internet-link guests see public shares only (and never the host's
-  LAN address). `/?json=1` (or an `Accept: application/json` request to `/`)
-  returns the same data as JSON. The admin console stays at `/admin`.
-- **Desktop-style UI** — a fixed sidebar + canvas app frame: the console puts
-  the share list front and center with network and internet-link panels in a
-  side rail; analytics is a two-pane view (request log ⇄ clients & blocking);
-  the guest page is a proper file manager with list/grid views, search, and a
-  status bar. All panes scroll inside the frame, with a light/dark toggle.
-- **Real shadcn/ui** — the admin console, the guest page, and analytics are
-  built with actual shadcn/ui components (React + Tailwind + Radix) in `app/`,
-  compiled into `app/dist/` and served statically. Bump the design by
-  editing `app/src` and rebuilding.
-- **Folder shares** — map any folder to a short web address, e.g.
-  `D:\Movies` → `/files/movies`. Guests open `http://<your-ip>:8787/files/movies/`.
-  (The address you pick is the share *name*; folder shares always live under
-  `/files/`. Guest links are plain `http://` — the old self-signed HTTPS mode
-  was removed on purpose.) Each share can be visible on the Wi-Fi, through
-  the internet link, or both.
-- **App-port shares** — expose anything already running on this computer under
-  the same style of address but without a prefix: `/webapp` → `127.0.0.1:3000`.
-  Every request under the address is forwarded to that local port.
-  Apps usually expect to own a whole site: they write root-absolute paths
-  (`/static/app.css`), absolute form actions, and `Location: /login` — fine at
-  an origin of their own, broken under a path. The share repairs that on its
-  own, without subdomains or an app-side base-path setting: opening
-  `/webapp` redirects to `/webapp/`, complete (uncompressed, reasonably small)
-  HTML and CSS responses are rewritten in place so root-absolute references
-  resolve under the share. Root-scoped app cookies are namespaced per share so
-  they work on root-level API paths without collisions; `Location:` headers
-  are repointed. Runtime URLs such as `fetch('/api/...')` use the same-origin
-  Referer to select the app that served the page. This supports multiple app
-  shares on one hostname without subdomains. A session cookie keeps root-level SPA routes
-  such as `/pair` associated with the selected app after navigation. Requests
-  without a matching referrer or app session fall back only when one app
-  share is visible; ambiguous requests stay unclaimed. Streamed,
-  compressed or oversized responses pass through untouched; inline script
-  bodies keep their exact bytes. WebSockets are rejected with a clear 501 page;
-  regular HTTP only. A T3 Code share on port 3773 redirects its root to `/pair`.
-- **One-time PIN lock (6 digits)** — any share can require a 6-digit PIN.
-  The first PIN-less visit gets a small lock page (401); a wrong PIN gets
-  403 and throttling; the right PIN answers 303 with a `Set-Cookie:
-  xpin-<route>=…` cookie (a SHA-256 of the PIN, never the PIN itself) so the
-  browser remembers it for 6 months. Links that carry it
-  (`/files/movies/?pin=123456`) unlock on the spot. Copies and QR codes from
-  the admin page include the PIN automatically, and the PIN never shows up
-  in the access log. The owner's own computer (localhost) skips the gate —
-  and its throttle — entirely.
-- **Folders you shared are remembered** — after you unshare (or restart), the
-  folder stays in the "Recent" chips of the add form and the folder picker, so
-  re-sharing is one click, not a re-browse.
-- **Your addresses** — the console lists every LAN IP of this computer, and
-  every share has a **QR** button (also for the public link while it's running).
-  The QR dialog is deliberately small so it never overflows on phones.
-- **Analytics** — an `/analytics` page (same admin protection) with:
-  - every guest request to shares: time, IP, method, path, status, bytes,
-    share name, blocked flag,
-  - aggregated **clients**: how much each IP took, device guess, last seen,
-  - **blocking**: one click blocks an address — blocked IPs get a 403 on all
-    guest traffic at the proxy (localhost can't be blocked). Unblock anytime.
-    Logs keep the last 3000 requests + 600 clients and survive restarts
-    (`data/logs.json`); the web UI can auto-refresh 5s live, and the log can
-    be cleared in place without losing the analytics page.
-- **Internet link** — one click runs `cloudflared` as a *quick tunnel* pointed
-  at the proxy port and gives a random `https://something.trycloudflare.com`
-  address you can send to anyone. Tunnel URLs are path-based
-  (`…/files/movies/`, `/webapp`) — no subdomains, so everything a guest can
-  reach over Wi-Fi works identically through the link, except `/admin` and
-  `/analytics`, which answer 403 "Not available on the public link". You
-  don't need a Cloudflare account, and nothing is permanently exposed: the
-  link is live only while the tunnel runs, and each run gets a fresh address.
-  If cloudflared isn't installed, the app downloads it for you (Windows) or
-  tells you what to install (`brew install cloudflared` / `apt install cloudflared`).
-- **Receiver page** — minimal list with previews (image, video, audio, PDF,
-  text/code), per-file downloads, prev/next between files, a search box, and
-  "Download all (.zip)" for the current folder.
+1. Open the admin console and add a folder share.
+2. Choose a folder and an address such as `photos`.
+3. Enable Wi-Fi visibility. Optionally set a six-digit PIN.
+4. Save, then copy the Wi-Fi link or display its QR code.
+5. Open the link on another device on the same network.
 
-## Ports
+Example guest address:
 
-Defaults: proxy **8787** (public) + internal web **3000**, api **5000**,
-files **8080**. A service whose preferred port is taken bumps to the next
-free one and reports its actual port to the supervisor over IPC. The supervisor alone
-updates `data/runtime.json`, with a run ID and the PID of each ready service.
-
-- **Live port change** — the proxy rebinds itself when the saved `proxyPort`
-  changes (the console or `PATCH /api/settings {"proxyPort": n}` rewrites
-  `config.json`; the proxy watches the file). If the wanted port is taken it
-  sticks; if the rebind fails it rolls back to the previous port. Route
-  changes, PINs and blocks apply live without any restart.
-- **Locked port** — starting with `--port <n>` / `EXTRANET_PORT` pins the
-  proxy port for that run: never persisted, and live port changes are
-  ignored while it's set.
-- Per-service env overrides: `EXTRANET_WEB_PORT`, `EXTRANET_API_PORT`,
-  `EXTRANET_FILES_PORT`, `EXTRANET_PROXY_PORT` (legacy `EXTRANET_PORT` means
-  the proxy).
-- Old single-server `config.json` (`httpPort` + `mounts`) migrates on load:
-  `mounts` become `routes`, `httpPort` becomes `proxyPort`; the file itself
-  is only rewritten on the next save.
-
-## Security model
-
-- The server is read-only. Guests can list, view and download, never write.
-- Every guest folder request is resolved against the share's folder; escaping
-  it (`..`, symlinks pointing outside, UNC tricks) returns "nothing here".
-- Share PINs: guessing is throttled — 30 wrong entries in 10 minutes from one
-  address pauses that address for 15 minutes. PINs are not logged or visible
-  to guests (the cookie is a hash, not the PIN itself). The owner's own
-  computer (localhost) never needs a PIN.
-- The admin console, its APIs and `/analytics`:
-  - always open from `localhost` (the computer running the server),
-  - from other devices only with the **admin token** printed at startup,
-  - never reachable through the public Cloudflare link (403 there).
-- The API service trusts localhost without a token; from the LAN the admin
-  token is required.
-- Blocklist applies to guest traffic from that address (Wi-Fi **and** internet
-  link); this computer (localhost) can never be blocked or locked out.
-- Shares are opt-in: nothing is served until you add one.
-
-## Rebuilding the UI
-
-The web service serves the prebuilt bundle in `app/dist/` (pages at `/`,
-`/admin`, `/analytics`; assets under `/app/assets/`). To change the design:
-
-```
-npm run setup       # once — installs React/Vite/Tailwind/shadcn deps inside app/
-npm run build       # rebuilds app/dist from app/src
+```text
+http://<your-computer-ip>:8787/files/photos/
 ```
 
-`app/dist/` is gitignored: the launcher builds it itself when it's missing
-(and a build toolchain is installed), and an npm-packaged copy carries it via
-the `files` list built right before publishing. For live-reload UI work:
-`npm run setup`, run `npm start`, then `npm run dev` inside `app/` and open
-the Vite URL — API calls are proxied to the API service automatically. To
-check that the four pages still boot against a running server:
-`npm run smoke` (it picks up the proxy port from `EXTRANET_PORT` or
-`data/config.json`).
+Folder sharing is read-only: guests can browse, preview, and download, but cannot
+upload, edit, or delete. Removing a share revokes access through Extranet without
+deleting the original folder.
 
-## Files it creates
+### Send an internet link
 
+1. Enable internet visibility for the share.
+2. In **Internet link**, set up `cloudflared` if needed. Extranet can download it
+   on Windows. On macOS or Linux, install it separately and put it on your PATH.
+3. Start the internet link and wait for its public address.
+4. Copy the share's public link or QR code.
+
+The address looks like `https://<random-name>.trycloudflare.com`. Only shares
+with internet visibility are accessible through it. The admin console and
+analytics are blocked through the public link.
+
+Stopping the tunnel closes the link. Starting a new tunnel produces a new
+address, so send the updated link to guests. You can also turn off internet
+visibility for one share while leaving the tunnel running.
+
+### Share an app
+
+Start the app on this computer, then add an app-port share using its actual
+listening port. An address such as `demo` produces:
+
+```text
+http://<your-computer-ip>:8787/demo/
 ```
-bin/                 the npx launcher
-server/              the four services + supervisor
-app/                 the real shadcn/ui frontend (React + Tailwind)
-app/dist/            the compiled UI the web service serves (gitignored, built from app/)
-data/config.json     settings, route registry (with their PINs), recent folders, blocked IPs
-data/runtime.json    the ports the four services actually bound (written per service)
-data/logs.json       access log for /analytics (last 3000 requests + 600 clients), proxy-owned
-data/bin/            cloudflared, if you used "Set up"
+
+Extranet's internal web service prefers port 3000. If your app uses that port,
+start it first or give it a different port.
+
+Regular HTTP is supported, with rewriting for supported HTML/CSS links,
+redirects, and cookies. Compatibility depends on the app. **WebSockets are not
+supported**, so some live features and development servers will not work.
+An app-side base-path setting is preferable when available. Compressed,
+streaming, and oversized responses pass through without content rewriting.
+
+An app share can expose the app's own write actions and permissions. The
+read-only restriction applies to Extranet folder shares.
+
+## Install a standalone command
+
+From a checkout with dependencies installed, create a distributable package:
+
+```sh
+npm pack
 ```
 
-## Notes
+This builds the backend and UI and creates `extranet-1.0.0.tgz`. Copy that file
+to the destination computer, then run:
 
-- First run on Windows: allow **Node.js** on *private networks* in the firewall
-  prompt, or guests can't connect.
-- If a phone can't reach the server, it's almost always the firewall prompt,
-  router "AP/client isolation", or being on a different network (guest Wi-Fi).
-- The public link is someone's whole-internet access — only mark folders
-  **Internet** that you're comfortable with strangers seeing (the PIN gate
-  helps here; you can also always stop the link or un-mark the share).
-- App-port shares repair root-absolute HTML/CSS references and give
-  runtime-built URLs a fallback path (see "App-port shares" above), so apps
-  usually work as-is. An app-side base-path setting is still the cleaner
-  mechanism when one exists, but it's no longer required.
-- iOS PDF preview can be stubborn inside the page; use the download button or
-  "open in new tab" there.
-- If a service worker crashes, the supervisor restarts it within a second or
-  two and guest traffic dips briefly (a 502) before recovering on its own.
+```sh
+npm install --global ./extranet-1.0.0.tgz
+extranet
+```
 
-## Troubleshooting cloudflared
+Use the filename printed by `npm pack` if the version changes. The package
+includes compiled JavaScript and the built UI. End users need Node.js and npm,
+but do not need TypeScript, Vite, Git, or frontend build tools. Use `extranet`
+for an installed package; `npm start` is for source checkouts. These commands
+do not publish anything to the npm registry.
 
-Start logs are kept in memory; if the tunnel errors, the console shows the
-last message under the Internet link section.
+To update, stop Extranet, install a newer tarball using the same command, and
+start it again. Saved data is stored outside the installed package.
 
-## Development checks
+## Addresses and access
 
-Run `npm test` for isolated backend stability checks (temporary data only),
-`npm run typecheck` for frontend TypeScript validation, and `npm run build`
-for the production UI. The backend checks cover config migration, failed saves,
-malformed config, occupied ports, concurrent startup, and API crash recovery.
+- `/`: guest directory showing visible shares.
+- `/admin`: share, network, and internet-link management.
+- `/analytics`: request history, clients, and blocking controls.
+- `/files/<name>/`: a folder share.
+- `/<name>/`: an app share.
 
-Config saves replace the file atomically. If an existing config cannot be read,
-startup fails with its path rather than replacing shares or credentials with
-fresh defaults. A running config watcher retains its last valid state if a
-reload fails. Correct the config file before restarting.
+Local management does not need a token. Management API calls from another LAN
+device require the admin token printed at startup. Keep it private. Share PINs
+are separate from the admin token. Localhost bypasses share PINs; test PIN entry
+from another device.
+
+Copied share links and QR codes include the PIN when one is configured. Anyone
+with that link has the PIN. Wi-Fi links use plain HTTP; public tunnel links use
+HTTPS. Share folders and apps intended for the selected audience.
+
+## Saved data and backups
+
+Shares, settings, recent folders, and blocked IPs survive restarts. Original file
+contents stay in their folders and are streamed when requested.
+
+Data lives in `data/` in a checkout **if that directory already exists**;
+otherwise it lives in `~/.extranet/data` (`%USERPROFILE%\.extranet\data` on
+Windows). Standalone installs normally use the home-directory location.
+Set `EXTRANET_DATA_DIR` to an absolute path to choose a predictable location.
+
+```text
+config.json     Shares, PINs, admin token, settings, recent folders, blocked IPs
+runtime.json    Current run ID, service PIDs, and ports; regenerated on startup
+logs.json       Recent request history and client statistics
+bin/            cloudflared binary, if installed through Extranet
+```
+
+To back up settings, stop Extranet and copy `config.json` to a private location.
+Restore it to the same data directory before restarting. Back up shared folders
+separately. The config contains credentials and local folder paths.
+
+Saves are atomic. A malformed or unreadable existing config causes startup to
+fail rather than replacing your settings. Restore a valid backup or correct the
+file named in the error, then restart.
+
+### Change ports
+
+From a checkout:
+
+```sh
+npm start -- --port 6060
+```
+
+From a standalone install:
+
+```sh
+extranet --port 6060
+```
+
+This override applies to the current run. You can save a proxy port in the
+console for future runs; a command-line override takes precedence. Occupied
+ports are skipped, so use the actual address printed at startup.
+
+Advanced environment variables, set in your shell before launching:
+
+- `EXTRANET_DATA_DIR`: persistent data location.
+- `EXTRANET_PUBLIC_DIR`: built frontend directory.
+- `EXTRANET_PORT` or `EXTRANET_PROXY_PORT`: proxy port override.
+- `EXTRANET_WEB_PORT`, `EXTRANET_API_PORT`, `EXTRANET_FILES_PORT`: internal preferred ports.
+
+Only the proxy listens on all network interfaces. Internal services bind to loopback.
+
+## Troubleshooting
+
+**Another device cannot connect:** use the LAN link, rather than `localhost`.
+Check the host firewall, both devices' networks, and router client isolation
+or guest Wi-Fi restrictions.
+
+**A share is missing:** check Wi-Fi/internet visibility, that its folder still
+exists, and that Extranet can read it.
+
+**The public link stopped working:** keep the computer awake, confirm the tunnel
+is running, and copy its current URL. Tunnel errors appear under Internet link.
+Check that `cloudflared` is installed and can access the internet.
+
+**An app partially loads:** check its actual port, base-path support, and whether
+it requires WebSockets. See the app-sharing limitations above.
+
+**The UI is missing:** run `npm run build` in a source checkout, then restart.
+For standalone installs, reinstall a correctly built package. The `--build`
+flag is only for rebuilding a source checkout's UI.
+
+**Service unavailable:** crashed services restart automatically, up to ten
+attempts. Inspect the `[web]`, `[api]`, `[files]`, or `[proxy]` terminal messages
+if failures continue, address the cause, and restart.
+
+## Development
+
+The backend, CLI, tests, frontend, and smoke tooling are TypeScript. Backend and
+test compilation uses strict type checking.
+
+```text
+bin/cli.ts          CLI source
+server/index.ts     Supervisor and runtime registry
+server/proxy.ts     Public HTTP edge, app forwarding, access logs
+server/api.ts       Management API, tunnel control, guest directory
+server/files.ts     Folder browsing, downloads, ZIP streaming
+server/web.ts       Static UI service
+server/lib.ts       Shared persistence, routing, and PIN helpers
+server/types.ts     Shared domain types
+app/src/            React UI
+app/smoke.ts        Optional DOM smoke checks
+test/               Isolated backend regression tests
+dist/               Compiled backend, CLI, and tests (generated)
+app/dist/           Built frontend (generated)
+```
+
+From the repository root:
+
+```sh
+npm run typecheck   # Backend, frontend, and tooling types
+npm test            # Compile and run backend regression tests
+npm run build       # Build backend and frontend
+npm start           # Run the backend
+```
+
+For frontend development, keep `npm start` running in one terminal and run
+`npm run dev` in another. Open the Vite address with `/app/admin.html` appended
+for the admin interface. Vite proxies API requests to `http://localhost:8787`;
+set `VITE_BACKEND` if the backend uses another address. Backend edits require
+restarting `npm start`.
+
+`npm run smoke` compiles and runs optional DOM checks against a running server
+and built UI. It currently expects a folder share named `movies`. Use `npm test`
+for isolated checks without existing shares.
+
+The proxy prefers **8787**; internal web, API, and files services prefer **3000**,
+**5000**, and **8080**. Children report readiness over IPC; the supervisor writes
+`runtime.json`. Services read configuration and port changes from disk. The
+proxy owns access logs. Packages include `dist/server/`, `dist/bin/`, and
+`app/dist/`, so installation requires no compilation.

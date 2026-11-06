@@ -1,3 +1,5 @@
+import type { Share, ServiceName, ClientKind, VisitorContext, Battery, Tunnel, AccessLog } from './types';
+import type { FastifyRequest, FastifyReply, FastifyBodyParser } from 'fastify';
 'use strict';
 /*
  * Extranet API service — the JSON API on :5000.
@@ -25,53 +27,53 @@
  * admin token.
  */
 
-const http = require('http');
-const https = require('https'); // used only for the cloudflared download
-const fs = require('fs');
+import * as http from 'http';
+import * as https from 'https'; // used only for the cloudflared download
+import * as fs from 'fs';
 const fsp = fs.promises;
-const path = require('path');
-const os = require('os');
-const crypto = require('crypto');
-const dns = require('dns');
-const { spawn, spawnSync } = require('child_process');
-const Fastify = require('fastify');
-const lib = require('./lib');
+import * as path from 'path';
+import * as os from 'os';
+import * as crypto from 'crypto';
+import * as dns from 'dns';
+import { spawn, spawnSync } from 'child_process';
+import Fastify from 'fastify';
+import * as lib from './lib';
 
 const { IS_WIN, BIN_DIR } = lib;
 
-let QRCode = null;
+let QRCode: typeof import('qrcode') | null = null;
 try { QRCode = require('qrcode'); } catch { /* optional: served without QR */ }
 
 /* ------------------------------------------------------------------ */
 /* Small helpers                                                        */
 /* ------------------------------------------------------------------ */
 
-function json(reply, status, obj) {
+function json(reply: FastifyReply, status: number, obj: unknown) {
   return reply.code(status).header('Cache-Control', 'no-store').send(obj);
 }
 
 /* request bodies arrive as raw buffers (or '' when empty) — parse client JSON out */
-function parseBody(req) {
+function parseBody(req: FastifyRequest) {
   const b = req.body;
   if (b == null) return {};
   if (Buffer.isBuffer(b)) return b.length ? JSON.parse(b.toString('utf8')) : {};
   return JSON.parse(String(b));
 }
 
-function pushRecentDir(dir) {
+function pushRecentDir(dir: string) {
   const d = String(dir || '').trim();
   if (!d) return;
   lib.config.recentDirs = [d, ...lib.config.recentDirs.filter((x) => String(x).toLowerCase() !== d.toLowerCase())].slice(0, 10);
 }
 
-function publicSharePath(m) {
+function publicSharePath(m: Share) {
   return (m.kind === 'folder' ? '/files' : '') + m.path;
 }
 
 /* the port a service actually bound (runtime.json), else its preferred one */
 function portsState() {
   const r = lib.readRuntime();
-  const pick = (name, fallback) => (Number.isInteger(r[name]) ? r[name] : fallback);
+  const pick = (name: ServiceName, fallback: number) => (Number.isInteger(r[name]) ? r[name]! : fallback);
   return {
     proxy: pick('proxy', lib.config.proxyPort),
     web: pick('web', lib.DEFAULT_PORTS.web),
@@ -84,9 +86,9 @@ function portsState() {
 /* Machine facts for the start page (battery, host internet)            */
 /* ------------------------------------------------------------------ */
 
-const sys = { battery: null, internet: null, busy: false };
+const sys: { battery: Battery | null; internet: boolean | null; busy: boolean } = { battery: null, internet: null, busy: false };
 
-function runTool(bin, args, timeoutMs) {
+function runTool(bin: string, args: string[], timeoutMs: number): Promise<string | null> {
   return new Promise((resolve) => {
     let child;
     try { child = spawn(bin, args, { windowsHide: true }); } catch { return resolve(null); }
@@ -117,7 +119,7 @@ async function batteryFromPmset() {
   const m = /\b(\d+)%;\s*([a-z-]+);/.exec(String(out)) || /\b(\d+)%/.exec(String(out));
   if (!m) return null;
   const level = parseInt(m[1], 10);
-  if (!(level >= 0 && level <= 100)) return null;
+  if (level === null || !(level >= 0 && level <= 100)) return null;
   const state = (m[2] || '').toLowerCase();
   const ac = /'AC Power'/.test(out);
   return { present: true, level, charging: state === 'charging', ac };
@@ -126,14 +128,14 @@ async function batteryFromPmset() {
 /* Linux: /sys/class/power_supply — a BAT* entry holds capacity + status, mains
  * adapters live in the sibling entries */
 async function batteryFromSysfs() {
-  let names = [];
+  let names: string[] = [];
   try { names = await fsp.readdir('/sys/class/power_supply'); } catch { return null; }
   const bat = names.find((n) => /^BAT/i.test(n));
   if (!bat) return null;
-  let level = null, status = '';
+  let level: number | null = null, status = '';
   try { level = parseInt((await fsp.readFile(`/sys/class/power_supply/${bat}/capacity`, 'utf8')).trim(), 10); } catch { /* gone */ }
   try { status = (await fsp.readFile(`/sys/class/power_supply/${bat}/status`, 'utf8')).trim().toLowerCase(); } catch { /* gone */ }
-  if (!(level >= 0 && level <= 100)) return null;
+  if (level === null || !(level >= 0 && level <= 100)) return null;
   let ac = false;
   for (const n of names) {
     if (/^BAT/i.test(n)) continue;
@@ -148,12 +150,12 @@ async function batteryFromSysfs() {
 async function readBattery() {
   try {
     if (IS_WIN) {
-      let d = null;
+      let d: { hasBattery?: boolean; level?: number; online?: boolean } | null = null;
       const out = await batteryFromPowershell();
       try { d = JSON.parse(String(out).trim()); } catch { /* unreadable */ }
       if (!d || d.hasBattery !== true) return null;
       const level = Math.round(Number(d.level));
-      if (!(level >= 0 && level <= 100)) return null;
+      if (level === null || !(level >= 0 && level <= 100)) return null;
       return { present: true, level, charging: d.online === true && level < 100, ac: d.online === true };
     }
     if (process.platform === 'darwin') return await batteryFromPmset();
@@ -162,10 +164,10 @@ async function readBattery() {
 }
 
 /* one cheap OS resolver hit — "does this machine itself reach the internet" */
-function checkInternet() {
+function checkInternet(): Promise<boolean> {
   return new Promise((resolve) => {
     try {
-      dns.lookup('one.one.one.one', { timeout: 4000 }, (err, address) => resolve(!err && !!address));
+      dns.lookup('one.one.one.one', (err, address) => resolve(!err && !!address));
     } catch { resolve(false); }
   });
 }
@@ -191,7 +193,7 @@ function startSysTicker() {
 /* Cloudflare quick tunnel (dials the reverse proxy)                    */
 /* ------------------------------------------------------------------ */
 
-const tunnel = {
+const tunnel: Tunnel = {
   proc: null,
   status: 'stopped', // stopped | starting | running | stopping
   url: null,
@@ -231,7 +233,7 @@ async function installCloudflared() {
     tunnel.binPath = dest;
     tunnel.installProgress = 'done';
     return { ok: true };
-  } catch (err) {
+  } catch (caught) { const err = caught as NodeJS.ErrnoException;
     tunnel.error = 'download failed: ' + err.message;
     tunnel.installProgress = 'failed';
     return { ok: false, error: tunnel.error };
@@ -240,12 +242,12 @@ async function installCloudflared() {
   }
 }
 
-function downloadToFile(url, dest, onProgress) {
-  return new Promise((resolve, reject) => {
-    const get = (u, hops) => {
+function downloadToFile(url: string, dest: string, onProgress: (progress: string) => void) {
+  return new Promise<void>((resolve, reject) => {
+    const get = (u: string, hops: number) => {
       if (hops > 5) return reject(new Error('too many redirects'));
       https.get(u, { headers: { 'User-Agent': 'extranet/1.0' } }, (res) => {
-        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        if ((res.statusCode || 0) >= 300 && (res.statusCode || 0) < 400 && res.headers.location) {
           res.resume();
           return get(new URL(res.headers.location, u).href, hops + 1);
         }
@@ -288,13 +290,13 @@ function startTunnel() {
     let proc;
     try {
       proc = spawn(bin, args, { windowsHide: true });
-    } catch (err) {
+    } catch (caught) { const err = caught as NodeJS.ErrnoException;
       tunnel.status = 'stopped';
       tunnel.error = err.message;
       return resolve({ ok: false, error: err.message });
     }
     tunnel.proc = proc;
-    const onData = (buf) => {
+    const onData = (buf: Buffer) => {
       const s = buf.toString();
       tunnel.log.push(s);
       if (tunnel.log.length > 60) tunnel.log.splice(0, tunnel.log.length - 60);
@@ -352,7 +354,7 @@ function tunnelState() {
 /* Directory (guest start page payload) + console state                 */
 /* ------------------------------------------------------------------ */
 
-function directoryState(ctx) {
+function directoryState(ctx: VisitorContext) {
   const shares = lib.config.routes
     .filter((m) => {
       if (ctx.isTunnel) return m.public === true;   // internet link guests: internet-marked shares only
@@ -360,7 +362,7 @@ function directoryState(ctx) {
       return m.lan !== false;                        // Wi-Fi guests: Wi-Fi-marked shares only
     })
     .map((m) => {
-      const out = { path: publicSharePath(m), kind: m.kind === 'port' ? 'app' : 'folder', pin: !!m.pin };
+      const out: { path: string; kind: string; pin: boolean; dir?: string | null; port?: number | null; scope?: string } = { path: publicSharePath(m), kind: m.kind === 'port' ? 'app' : 'folder', pin: !!m.pin };
       if (ctx.local) {
         out.dir = m.dir || null;
         out.port = m.port || null;
@@ -385,7 +387,7 @@ function directoryState(ctx) {
   };
 }
 
-function publicRoute(m) {
+function publicRoute(m: Share) {
   return {
     id: m.id,
     kind: m.kind || 'folder',
@@ -398,7 +400,7 @@ function publicRoute(m) {
   };
 }
 
-function buildState(ctx) {
+function buildState(ctx: VisitorContext) {
   return {
     app: 'Extranet',
     hostname: os.hostname(),
@@ -420,12 +422,12 @@ function buildState(ctx) {
 /* Analytics (reads the log file the proxy owns)                        */
 /* ------------------------------------------------------------------ */
 
-function isBlocked(ip) {
+function isBlocked(ip: string) {
   return lib.config.blockedIPs.some((b) => b.ip === ip);
 }
 
-async function readAnalytics(limit) {
-  let d = { entries: [], ips: {} };
+async function readAnalytics(limit: number) {
+  let d: AccessLog = { entries: [], ips: {} };
   try { d = JSON.parse(fs.readFileSync(lib.LOG_FILE, 'utf8')); } catch { /* fresh */ }
   const all = Array.isArray(d.entries) ? d.entries : [];
   const entries = all.slice(-limit).reverse();
@@ -473,7 +475,7 @@ function writeEmptyLogs() {
 /* the public link is never allowed to manage anything)                 */
 /* ------------------------------------------------------------------ */
 
-function canManage(req, url, ctx) {
+function canManage(req: FastifyRequest, url: URL, ctx: VisitorContext) {
   if (ctx.isTunnel) return false;
   if (ctx.local) return true;
   const hdr = String(req.raw.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
@@ -481,7 +483,7 @@ function canManage(req, url, ctx) {
   return lib.timingSafeToken(hdr || q, lib.config.adminToken);
 }
 
-function adminDenied(reply, ctx) {
+function adminDenied(reply: FastifyReply, ctx: VisitorContext) {
   if (ctx.isTunnel) {
     return lib.sendRawHtml(reply.raw, 403, 'Not available on the public link', `<h1>Not available on the public link</h1>
 <p>This address is the public internet link — shares only. Open the link the app printed on your computer instead.</p>`);
@@ -493,7 +495,7 @@ function adminDenied(reply, ctx) {
 /* Route registry validation                                            */
 /* ------------------------------------------------------------------ */
 
-function normPortNumber(v, _label) {
+function normPortNumber(v: unknown, _label: string) {
   const n = Number(v);
   if (v === undefined || v === null || String(v).trim() === '' || !Number.isInteger(n) || n < 1024 || n > 65535) {
     return { error: 'the port number must be between 1024 and 65535' };
@@ -502,7 +504,7 @@ function normPortNumber(v, _label) {
 }
 
 /* body.pin: 6 digits to set, "" to clear; returns an error string or null */
-function applyPin(route, value) {
+function applyPin(route: Share, value: unknown) {
   if (value === undefined) return null;
   const s = String(value ?? '').trim();
   if (!s) { route.pin = null; return null; }
@@ -516,10 +518,10 @@ function applyPin(route, value) {
 /* Folder browser (admin share picker)                                  */
 /* ------------------------------------------------------------------ */
 
-async function handleFsBrowse(reply, input) {
+async function handleFsBrowse(reply: FastifyReply, input: string) {
   let p = String(input).trim().replace(/^["']|["']$/g, '');
   if (!p) {
-    const drives = [];
+    const drives: { path: string; name: string }[] = [];
     if (IS_WIN) {
       for (let i = 67; i <= 90; i++) {
         const d = String.fromCharCode(i) + ':\\';
@@ -540,7 +542,7 @@ async function handleFsBrowse(reply, input) {
   if (!st) return json(reply, 400, { error: `no folder found at ${abs}` });
   if (!st.isDirectory()) return json(reply, 400, { error: `${abs} is a file, not a folder` });
   try { abs = await fsp.realpath(abs); } catch { /* keep resolved */ }
-  let dirs = [];
+  let dirs: { path: string; name: string }[] = [];
   try {
     const items = await fsp.readdir(abs, { withFileTypes: true });
     dirs = items
@@ -549,7 +551,7 @@ async function handleFsBrowse(reply, input) {
       .slice(0, 500)
       .map((d) => ({ path: path.join(abs, d.name), name: d.name }))
       .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
-  } catch (err) {
+  } catch (caught) { const err = caught as NodeJS.ErrnoException;
     return json(reply, 400, { error: `can't read ${abs}: ${err.message}` });
   }
   const parent = path.dirname(abs);
@@ -566,7 +568,7 @@ async function handleFsBrowse(reply, input) {
 /* ------------------------------------------------------------------ */
 
 const app = Fastify({ logger: false, bodyLimit: 2 * 1024 * 1024 });
-const rawBodyParser = (_req, body, done) => done(null, body == null ? '' : body);
+const rawBodyParser: FastifyBodyParser<Buffer> = (_req, body, done) => done(null, body == null ? '' : body);
 app.addContentTypeParser('application/json', { parseAs: 'buffer' }, rawBodyParser);
 app.addContentTypeParser('*', { parseAs: 'buffer' }, rawBodyParser);
 
@@ -575,7 +577,7 @@ app.addContentTypeParser('*', { parseAs: 'buffer' }, rawBodyParser);
 app.addHook('onRequest', (req, _reply, done) => {
   const raw = req.raw;
   const k = String(raw.headers['x-client-kind'] || 'local');
-  const kind = ['local', 'lan', 'tunnel'].includes(k) ? k : 'lan';
+  const kind: ClientKind = k === 'local' || k === 'tunnel' ? k : 'lan';
   req.ctx = {
     kind,
     isTunnel: kind === 'tunnel',
@@ -593,7 +595,7 @@ app.all('/api', apiRoute);
 app.all('/api/*', apiRoute);
 app.setNotFoundHandler((req, reply) => apiRoute(req, reply));
 
-async function apiRoute(req, reply) {
+async function apiRoute(req: FastifyRequest, reply: FastifyReply) {
   const url = new URL(req.raw.url || '/api', 'http://internal');
   if (!url.pathname.startsWith('/api')) return json(reply, 404, { error: 'not found' });
   const ctx = req.ctx;
@@ -661,7 +663,7 @@ async function apiRoute(req, reply) {
     if (lib.isReserved(p)) return json(reply, 400, { error: `the address ${p} is reserved` });
     if (lib.config.routes.some((m) => m.path === p)) return json(reply, 400, { error: `the address ${p} is already used` });
     const kind = body.kind === 'port' ? 'port' : 'folder';
-    const route = {
+    const route: Share = {
       id: crypto.randomUUID(),
       kind,
       path: p,
@@ -767,7 +769,7 @@ async function apiRoute(req, reply) {
         setTimeout(() => startTunnel(), 2500);
       }
       return;
-    } catch (err) {
+    } catch (caught) { const err = caught as NodeJS.ErrnoException;
       return json(reply, 400, { error: err.message });
     }
   }

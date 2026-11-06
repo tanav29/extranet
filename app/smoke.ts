@@ -4,7 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { pathToFileURL } from "node:url";
 
-const base = path.dirname(fileURLToPath(import.meta.url)); // app/
+const base = path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."); // app/
 const pub = path.resolve(base, "dist", "assets");
 
 /* the running proxy's port: EXTRANET_PORT, data/config.json proxyPort, else the default */
@@ -24,27 +24,31 @@ function serverOrigin() {
 }
 const ORIGIN = serverOrigin();
 
-function entryChunk(prefix) {
+function entryChunk(prefix: string) {
   const files = fs.readdirSync(pub).filter((f) => f.startsWith(prefix + "-") && f.endsWith(".js"));
   return files.sort((a, b) => fs.statSync(path.join(pub, b)).size - fs.statSync(path.join(pub, a)).size)[0];
 }
 
+interface BootResult { ok: boolean; error?: string; missing?: string[]; crashed?: boolean; len?: number; html?: string }
+
 const SKIP = new Set(["window", "document", "globalThis", "top", "parent", "self", "frames", "console"]);
 
-async function boot(url, prefix, checks) {
+async function boot(url: string, prefix: string, checks: string[]): Promise<BootResult> {
   const win = new Window({ url });
   win.document.body.innerHTML = '<div id="root"></div>';
 
+  const globals = globalThis as unknown as Record<string, unknown>;
+  const properties = win as unknown as Record<string, unknown>;
   // expose the DOM world to node so react/radix code paths can run
   for (const key of Object.getOwnPropertyNames(win)) {
     if (SKIP.has(key)) continue;
-    if (typeof globalThis[key] === "undefined") {
-      try { globalThis[key] = win[key]; } catch { /* read-only */ }
+    if (typeof globals[key] === "undefined") {
+      try { globals[key] = properties[key]; } catch { /* read-only */ }
     }
   }
   // relative fetch must resolve against the happy-dom window URL (Node fetch cannot)
-  globalThis.fetch = (input, init) => win.fetch(input, init);
-  globalThis.ResizeObserver = globalThis.ResizeObserver || class { observe() {} unobserve() {} disconnect() {} };
+  globals.fetch = win.fetch.bind(win);
+  globals.ResizeObserver = globals.ResizeObserver || class { observe() {} unobserve() {} disconnect() {} };
   Object.defineProperty(globalThis, "navigator", { value: win.navigator, configurable: true });
   Object.defineProperty(globalThis, "document", { value: win.document, configurable: true });
   Object.defineProperty(globalThis, "location", { value: win.location, configurable: true });
@@ -55,7 +59,8 @@ async function boot(url, prefix, checks) {
   try {
     await import(pathToFileURL(chunk).href);
   } catch (e) {
-    return { ok: false, error: "import failed: " + (e.stack || e).slice(0, 500) };
+    const error = e instanceof Error ? e.stack || e.message : String(e);
+    return { ok: false, error: "import failed: " + error.slice(0, 500) };
   }
   await new Promise((r) => setTimeout(r, 1200));
   const html = win.document.body.innerHTML;
@@ -64,7 +69,7 @@ async function boot(url, prefix, checks) {
   return { ok: missing.length === 0 && !crashed, missing, crashed, len: html.length, html: html.slice(0, 220) };
 }
 
-const results = [];
+const results: [string, BootResult][] = [];
 results.push(["home", await boot(`${ORIGIN}/`, "home", ["Hi 👋", "Shared on this computer", "read-only"])]);
 results.push(["admin", await boot(`${ORIGIN}/admin`, "admin", ["This network", "Shared folders", "Internet link", "Analytics"])]);
 results.push(["analytics", await boot(`${ORIGIN}/analytics`, "analytics", ["Analytics", "Request log", "Clients"])]);

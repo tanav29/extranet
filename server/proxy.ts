@@ -1,3 +1,6 @@
+import type { AccessEvent, ClientStats, AccessLog, Share, VisitorContext, Runtime, ServiceName, ClientKind } from './types';
+import type { IncomingMessage, ServerResponse, OutgoingHttpHeaders } from 'node:http';
+import type { Socket } from 'node:net';
 'use strict';
 /*
  * Extranet reverse proxy — the public edge on :8787.
@@ -30,9 +33,9 @@
  * app-port share is being rewritten.
  */
 
-const http = require('http');
-const fs = require('fs');
-const lib = require('./lib');
+import * as http from 'http';
+import * as fs from 'fs';
+import * as lib from './lib';
 
 const { HOP_SKIP_REQ, HOP_SKIP_RES, EDGE_HEADERS, rawHeaderPairs } = lib;
 
@@ -43,11 +46,11 @@ const { HOP_SKIP_REQ, HOP_SKIP_RES, EDGE_HEADERS, rawHeaderPairs } = lib;
 const LOG_CAP = 3000;   // requests kept in memory & on disk
 const IP_CAP = 600;     // client entries kept on disk
 
-const logStore = { entries: [], ips: new Map(), t: 0 };
+const logStore: { entries: AccessEvent[]; ips: Map<string, ClientStats>; t: ReturnType<typeof setTimeout> | 0 } = { entries: [], ips: new Map(), t: 0 };
 
 (function loadLogs() {
   try {
-    const d = JSON.parse(fs.readFileSync(lib.LOG_FILE, 'utf8'));
+    const d: AccessLog = JSON.parse(fs.readFileSync(lib.LOG_FILE, 'utf8'));
     if (Array.isArray(d.entries)) logStore.entries = d.entries.slice(-LOG_CAP);
     for (const [ip, s] of Object.entries(d.ips || {})) {
       if (s && typeof s === 'object' && typeof s.count === 'number') logStore.ips.set(ip, s);
@@ -71,11 +74,11 @@ function scheduleFlush() {
   logStore.t = setTimeout(() => { logStore.t = 0; writeLogs(); }, 2000);
 }
 
-function isBlocked(ip) {
+function isBlocked(ip: string) {
   return lib.config.blockedIPs.some((b) => b.ip === ip);
 }
 
-function recordEvent(ev) {
+function recordEvent(ev: AccessEvent) {
   logStore.entries.push(ev);
   if (logStore.entries.length > LOG_CAP) logStore.entries.splice(0, logStore.entries.length - LOG_CAP);
   let s = logStore.ips.get(ev.ip);
@@ -98,7 +101,7 @@ function recordEvent(ev) {
 
 /* owner machinery stays out of the guest log; the one guest-facing API call
  * (/api/directory, the start page's data) is tracked, like ?json=1 was before */
-function isTrackablePath(p) {
+function isTrackablePath(p: string) {
   if (p.startsWith('/admin')) return false;
   if (p === '/app' || p.startsWith('/app/')) return false;
   if (p === '/analytics') return false;
@@ -108,25 +111,25 @@ function isTrackablePath(p) {
   return true;
 }
 
-function maybeRecord(ev) {
+function maybeRecord(ev: AccessEvent) {
   if (ev.blocked) return recordEvent(ev);   // security events always get logged
   if (!isTrackablePath(ev.path)) return;    // admin pages & static assets stay out
   recordEvent(ev);                          // guests AND the owner checking their own share
 }
 
 /* count bytes written to a response (for the analytics "data served" stat) */
-function tapResponse(res) {
+function tapResponse(res: TappedResponse) {
   if (res.__tap) return;
   res.__tap = true;
   res.__bytes = 0;
-  const size = (c) => {
+  const size = (c: unknown) => {
     if (!c) return;
-    try { res.__bytes += typeof c === 'string' ? Buffer.byteLength(c) : c.length; } catch { /* ignore */ }
+    try { res.__bytes! += typeof c === 'string' ? Buffer.byteLength(c) : c instanceof Uint8Array ? c.length : 0; } catch { /* ignore */ }
   };
   const origWrite = res.write.bind(res);
   const origEnd = res.end.bind(res);
-  res.write = function (chunk, ...rest) { size(chunk); return origWrite(chunk, ...rest); };
-  res.end = function (chunk, ...rest) { size(chunk); return origEnd(chunk, ...rest); };
+  res.write = ((...args: unknown[]) => { size(args[0]); return Reflect.apply(origWrite, res, args); }) as ServerResponse['write'];
+  res.end = ((...args: unknown[]) => { size(args[0]); return Reflect.apply(origEnd, res, args); }) as ServerResponse['end'];
 }
 
 /* ------------------------------------------------------------------ */
@@ -134,7 +137,12 @@ function tapResponse(res) {
 /* ------------------------------------------------------------------ */
 
 /* the three services — fixed registry entries, always present */
-const SERVICE_ROUTES = [
+type TappedResponse = ServerResponse & { __bytes?: number; __tap?: boolean };
+type ProxyMount = Share & { setPortCookie?: boolean };
+type DynamicRoute = { kind: 'folder' | 'port'; path: string; prefix: string; mount: Share };
+type ServiceRoute = { kind: 'service'; service: ServiceName; path: string };
+
+const SERVICE_ROUTES: ServiceRoute[] = [
   { kind: 'service', service: 'files', path: '/files' },
   { kind: 'service', service: 'api', path: '/api' },
   { kind: 'service', service: 'web', path: '/' },   // catch-all
@@ -142,8 +150,8 @@ const SERVICE_ROUTES = [
 
 /* the owner's shares, as routable entries (folder shares answer under the
  * /files prefix, app-port shares at their own top-level address) */
-function dynamicRoutes() {
-  const out = [];
+function dynamicRoutes(): DynamicRoute[] {
+  const out: DynamicRoute[] = [];
   for (const m of lib.config.routes) {
     if (!m.path) continue;
     if (m.kind === 'folder' && m.dir) out.push({ kind: 'folder', path: m.path, prefix: '/files' + m.path, mount: m });
@@ -153,15 +161,15 @@ function dynamicRoutes() {
 }
 
 /* which routes this kind of visitor may see */
-function routeVisible(mount, kind) {
+function routeVisible(mount: Share, kind: ClientKind) {
   if (kind === 'tunnel') return mount.public === true;
   if (kind === 'local') return true;
   return mount.lan !== false;
 }
 
 /* longest-prefix match; the catch-all service route is handled by the caller */
-function resolveRoute(pathname, kind) {
-  let best = null;
+function resolveRoute(pathname: string, kind: ClientKind) {
+  let best: DynamicRoute | null = null;
   for (const r of dynamicRoutes()) {
     if (!routeVisible(r.mount, kind)) continue;
     if (r.prefix !== pathname && !pathname.startsWith(r.prefix + '/')) continue;
@@ -179,8 +187,8 @@ function resolveRoute(pathname, kind) {
  * only when the visitor can see exactly one app. Otherwise ownership cannot
  * be determined safely.
  */
-function soleVisiblePortShare(kind) {
-  let found = null;
+function soleVisiblePortShare(kind: ClientKind) {
+  let found: Share | null = null;
   for (const m of lib.config.routes) {
     if (m.kind !== 'port' || !m.port) continue;
     if (!routeVisible(m, kind)) continue;
@@ -197,7 +205,7 @@ function soleVisiblePortShare(kind) {
  * when several apps are shared on this hostname. Explicit share routes are
  * resolved first, so their ownership is never changed by Referer.
  */
-function referringPortShare(raw, kind) {
+function referringPortShare(raw: IncomingMessage, kind: ClientKind) {
   const value = raw.headers.referer || raw.headers.referrer;
   if (!value) return null;
   let pathname;
@@ -211,7 +219,7 @@ function referringPortShare(raw, kind) {
 }
 
 /* T3-like apps can move SPA routes to the origin root after initial load. */
-function cookiePortShare(raw, kind) {
+function cookiePortShare(raw: IncomingMessage, kind: ClientKind) {
   const cookie = String(raw.headers.cookie || '');
   const match = cookie.match(/(?:^|;\s*)extranet-port-share=([^;]+)/);
   if (!match) return null;
@@ -219,7 +227,7 @@ function cookiePortShare(raw, kind) {
   return lib.config.routes.find((m) => m.kind === 'port' && m.id === id && m.port && routeVisible(m, kind)) || null;
 }
 
-function refererTargetsWebService(raw, kind) {
+function refererTargetsWebService(raw: IncomingMessage, kind: ClientKind) {
   const value = raw.headers.referer || raw.headers.referrer;
   if (!value) return false;
   try {
@@ -239,7 +247,7 @@ function refererTargetsWebService(raw, kind) {
 /* Visitor context                                                      */
 /* ------------------------------------------------------------------ */
 
-function requestIP(raw, isTunnel) {
+function requestIP(raw: IncomingMessage, isTunnel: boolean) {
   if (isTunnel) {
     const cf = raw.headers['cf-connecting-ip'];
     if (cf) return lib.normIP(cf);
@@ -249,7 +257,7 @@ function requestIP(raw, isTunnel) {
   return lib.normIP(raw.socket && raw.socket.remoteAddress);
 }
 
-function requestCtx(raw) {
+function requestCtx(raw: IncomingMessage): VisitorContext {
   const host = String(raw.headers.host || '').toLowerCase();
   const sock = raw.socket;
   // tunnel guests arrive through the local cloudflared process, so the
@@ -266,9 +274,9 @@ function requestCtx(raw) {
 /* Forwarding to the internal services (files / api / web)              */
 /* ------------------------------------------------------------------ */
 
-let runtime = {};   // watched copy of runtime.json: the ports services bound
+let runtime: Runtime = {};   // watched copy of runtime.json: the ports services bound
 
-function serviceUnavailable(res, service) {
+function serviceUnavailable(res: ServerResponse, service: ServiceName) {
   return lib.sendRawHtml(res, 502, 'Service unavailable', `<h1>Service unavailable</h1>
 <p>The ${lib.escapeHTML(service)} service is not answering. Restart Extranet (<code>npx extranet</code>) and try again.</p>`);
 }
@@ -279,11 +287,11 @@ function serviceUnavailable(res, service) {
  * uninterrupted pipe both ways. Only this proxy may tag the request with
  * the visitor context; anything a client sneaks in is dropped first.
  */
-function forwardService(service, req, res, ctx) {
+function forwardService(service: ServiceName, req: IncomingMessage, res: ServerResponse, ctx: VisitorContext) {
   const port = runtime[service];
   if (!port) return serviceUnavailable(res, service);
 
-  const headers = {};
+  const headers: OutgoingHttpHeaders = {};
   for (const [k, v] of Object.entries(req.headers)) {
     const name = k.toLowerCase();
     if (HOP_SKIP_REQ.has(name)) continue;
@@ -357,7 +365,7 @@ const MARKUP_ATTR_RE = /\s([a-zA-Z][\w:.-]*)\s*=\s*("[^"]*"|'[^']*'|[^\s"'=<>`]+
  * /\host read as hosts in browsers), and refs the app already writes under
  * the share path.
  */
-function shareRef(value, mountPath) {
+function shareRef(value: string, mountPath: string) {
   const v = String(value ?? '');
   if (!v) return null;
   if (v.charCodeAt(0) !== 0x2f) return null;                        // '/…' only
@@ -369,7 +377,7 @@ function shareRef(value, mountPath) {
   return mountPath + v;
 }
 
-function rewriteSrcsetValue(value, mountPath) {
+function rewriteSrcsetValue(value: string, mountPath: string) {
   return String(value).split(',').map((part) => part.replace(
     /^(\s*)(\S*)/,
     (m, pad, url) => {
@@ -380,7 +388,7 @@ function rewriteSrcsetValue(value, mountPath) {
 }
 
 /* url(/a.png), @import url(/theme.css) and @import "/theme.css" */
-function rewriteCssText(css, mountPath) {
+function rewriteCssText(css: string, mountPath: string) {
   return String(css)
     .replace(/url\(\s*('((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)"|([^'"\s()]*))\s*\)/gi,
       (m, q, sq, dq, bare) => {
@@ -402,7 +410,7 @@ function rewriteCssText(css, mountPath) {
 /* attribute pass within one tag — only URL-carrying values are repointed,
    while tag syntax outside the value (name, =, quotes, spacing) is kept
    intact so the document never shifts around a changed ref */
-function rewriteTagAttrs(tagAttrs, mountPath) {
+function rewriteTagAttrs(tagAttrs: string, mountPath: string) {
   return tagAttrs.replace(MARKUP_ATTR_RE, (m, name, value) => {
     const attr = name.toLowerCase();
     const quoted = value.charCodeAt(0) === 0x22 || value.charCodeAt(0) === 0x27;
@@ -420,7 +428,7 @@ function rewriteTagAttrs(tagAttrs, mountPath) {
       if (direct) nv = direct;
       else {
         // <meta http-equiv="refresh" content="0; url=/next">
-        nv = inner.replace(/^([0-9.]+\s*;[^;]*?url=)\/(?!\/)(.*)$/is, (n, pre, rest) => {
+        nv = inner.replace(/^([0-9.]+\s*;[^;]*?url=)\/(?!\/)(.*)$/is, (n: string, pre: string, rest: string) => {
           const pr = shareRef('/' + rest, mountPath);
           return pr ? pre + pr : n;
         });
@@ -432,7 +440,7 @@ function rewriteTagAttrs(tagAttrs, mountPath) {
 }
 
 /* attributes inside real tags; text nodes, comments and doctypes stay untouched */
-function rewriteTags(html, mountPath) {
+function rewriteTags(html: string, mountPath: string) {
   MARKUP_TAG_RE.lastIndex = 0;
   let out = '';
   let from = 0;
@@ -449,7 +457,7 @@ function rewriteTags(html, mountPath) {
 /* markup without script elements: tag attributes plus inline <style> bodies.
    <style> content is CSS-shaped text, so it gets the same treatment as a
    .css response; an unterminated one simply stays raw. */
-function rewriteMarkup(html, mountPath) {
+function rewriteMarkup(html: string, mountPath: string) {
   STYLE_BLOCK_RE.lastIndex = 0;
   let out = '';
   let from = 0;
@@ -470,7 +478,7 @@ function rewriteMarkup(html, mountPath) {
  * no closing tag, or no '>' ending the closing tag, leaves the whole document
  * untouched instead of guessing where the code ends.
  */
-function rewriteHtmlDoc(text, mountPath) {
+function rewriteHtmlDoc(text: string, mountPath: string) {
   SCRIPT_OPEN_RE.lastIndex = 0;
   const lower = text.toLowerCase();
   let out = '';
@@ -493,7 +501,7 @@ function rewriteHtmlDoc(text, mountPath) {
 }
 
 /* web app manifest: repoint root-absolute icon/start_url/scope values under the share */
-function rewriteManifestJson(text, mountPath) {
+function rewriteManifestJson(text: string, mountPath: string) {
   return String(text).replace(/"(\/[^"]*)"/g, (m, v) => {
     const nv = shareRef(v, mountPath);
     return nv ? `"${nv}"` : m;
@@ -502,11 +510,11 @@ function rewriteManifestJson(text, mountPath) {
 
 /* App cookies stay root-scoped for root-relative API requests, but are
  * namespaced so two port shares can safely use the same upstream cookie name. */
-function appCookiePrefix(mount) {
+function appCookiePrefix(mount: Share) {
   return `xproxy-${String(mount.id || '').replace(/[^a-z0-9_-]/gi, '_')}-`;
 }
 
-function namespaceAppCookie(cookie, mount) {
+function namespaceAppCookie(cookie: string, mount: Share) {
   let value = String(cookie);
   value = value.replace(/^(\s*)([^=;\s]+)=/, (_match, space, name) => `${space}${appCookiePrefix(mount)}${name}=`);
   if (/;\s*path\s*=/i.test(value)) value = value.replace(/;\s*path\s*=\s*[^;]*/i, '; Path=/');
@@ -514,9 +522,9 @@ function namespaceAppCookie(cookie, mount) {
   return value;
 }
 
-function appCookiesForUpstream(header, mount) {
+function appCookiesForUpstream(header: string | string[] | undefined, mount: Share) {
   const prefix = appCookiePrefix(mount);
-  const kept = [];
+  const kept: string[] = [];
   for (const pair of String(header || '').split(';')) {
     const item = pair.trim();
     if (!item) continue;
@@ -536,7 +544,7 @@ function appCookiesForUpstream(header, mount) {
  * Location header: prefix path-absolute targets; absolute URLs minted against
  * the upstream host (127.0.0.1:<port>) become share-relative.
  */
-function proxyLocation(value, mountPath) {
+function proxyLocation(value: string, mountPath: string) {
   let v = String(value);
   if (/^https?:\/\/(?:localhost|127\.0\.0\.1)(?::\d+)?(?=[/?#]|$)/i.test(v)) {
     let u;
@@ -546,7 +554,7 @@ function proxyLocation(value, mountPath) {
   return shareRef(v, mountPath);
 }
 
-function proxyResponseHeaders(uRes, mount) {
+function proxyResponseHeaders(uRes: IncomingMessage, mount: ProxyMount) {
   const pairs = rawHeaderPairs(uRes.rawHeaders, HOP_SKIP_RES);
   for (let i = 0; i < pairs.length; i += 2) {
     const name = pairs[i];
@@ -565,7 +573,7 @@ function proxyResponseHeaders(uRes, mount) {
   return pairs;
 }
 
-function pipeUpstream(uRes, res, mount) {
+function pipeUpstream(uRes: IncomingMessage, res: ServerResponse, mount: ProxyMount) {
   try {
     res.writeHead(uRes.statusCode || 502, proxyResponseHeaders(uRes, mount));
     res.on('error', () => { try { uRes.destroy(); } catch { /* ignore */ } });
@@ -577,12 +585,12 @@ function pipeUpstream(uRes, res, mount) {
 }
 
 /* exact-size read; null when the stream ended short or overflowed */
-function drainUpstream(uRes, size) {
+function drainUpstream(uRes: IncomingMessage, size: number): Promise<Buffer | null> {
   return new Promise((resolve) => {
-    const chunks = [];
+    const chunks: Buffer[] = [];
     let got = 0;
     let done = false;
-    const finish = (v) => { if (!done) { done = true; resolve(v); } };
+    const finish = (v: Buffer | null) => { if (!done) { done = true; resolve(v); } };
     uRes.on('data', (c) => {
       if (done) return;
       got += c.length;
@@ -603,12 +611,12 @@ function drainUpstream(uRes, size) {
  * Responses to HEAD never get rewritten: no body arrives on the wire, so
  * their "content-length" is metadata, not bytes that will stream through.
  */
-function sendUpstreamBody(uRes, res, mount, noResponseBody) {
+function sendUpstreamBody(uRes: IncomingMessage, res: ServerResponse, mount: ProxyMount, noResponseBody: boolean) {
   if (res.writableEnded || res.destroyed || res.socket == null) { uRes.destroy(); return; }
   const ctype = String(uRes.headers['content-type'] || '');
   const size = parseInt(uRes.headers['content-length'] || '', 10);
   const hasCL = Number.isInteger(size) && size >= 0;
-  const isRedirect = uRes.statusCode >= 300 && uRes.statusCode < 400;
+  const isRedirect = (uRes.statusCode || 0) >= 300 && (uRes.statusCode || 0) < 400;
   const potentiallyRewriteable = !noResponseBody
     && !uRes.headers['content-encoding']
     && REWRITEABLE_TYPE.test(ctype)
@@ -619,9 +627,9 @@ function sendUpstreamBody(uRes, res, mount, noResponseBody) {
 
   (async () => {
     try {
-      let body = null;
+      let body: Buffer | null = null;
       let overflow = false;
-      const chunks = [];
+      const chunks: Buffer[] = [];
       if (hasCL) {
         body = await drainUpstream(uRes, size);
         if (body == null) { uRes.destroy(); try { res.destroy(); } catch { /* ignore */ } return; }
@@ -667,7 +675,7 @@ function sendUpstreamBody(uRes, res, mount, noResponseBody) {
       const out = Buffer.from(text, 'utf8');
 
       const pairs = proxyResponseHeaders(uRes, mount);
-      const final = [];
+      const final: string[] = [];
       for (let i = 0; i < pairs.length; i += 2) {
         const name = pairs[i];
         if (name === 'content-length' || name === 'etag') continue;
@@ -687,7 +695,7 @@ function sendUpstreamBody(uRes, res, mount, noResponseBody) {
 
 /* target path for an app-port upstream: the share prefix comes off, and the
  * PIN parameter (already consumed by the gate) doesn't travel downstream */
-function proxyTargetPath(url, upstreamBase) {
+function proxyTargetPath(url: URL, upstreamBase: string) {
   let pathname;
   if (!upstreamBase) pathname = url.pathname;
   else if (url.pathname === upstreamBase) pathname = '/';
@@ -699,7 +707,7 @@ function proxyTargetPath(url, upstreamBase) {
   return pathname + (q ? `?${q}` : '');
 }
 
-function servePortRoute(req, res, route, url, ctx, upstreamBase) {
+function servePortRoute(req: IncomingMessage, res: ServerResponse, route: DynamicRoute, url: URL, ctx: VisitorContext, upstreamBase: string) {
   const mount = route.mount;
   const proxyMount = upstreamBase ? { ...mount, setPortCookie: true } : mount;
   const method = (req.method || 'GET').toUpperCase();
@@ -732,7 +740,7 @@ function servePortRoute(req, res, route, url, ctx, upstreamBase) {
     return res.end();
   }
 
-  const headers = {};
+  const headers: OutgoingHttpHeaders = {};
   for (const [k, v] of Object.entries(req.headers)) {
     if (HOP_SKIP_REQ.has(k.toLowerCase())) continue;
     headers[k] = k.toLowerCase() === 'cookie' ? appCookiesForUpstream(v, mount) : v;
@@ -760,7 +768,7 @@ function servePortRoute(req, res, route, url, ctx, upstreamBase) {
       headers,
       agent: false, // one fresh upstream connection per visitor request
     }, (uRes) => sendUpstreamBody(uRes, res, proxyMount, noResponseBody));
-  } catch (err) {
+  } catch (caught) { const err = caught as NodeJS.ErrnoException;
     return appUnavailable(res, mount, err);
   }
   up.on('error', () => {
@@ -772,7 +780,7 @@ function servePortRoute(req, res, route, url, ctx, upstreamBase) {
   req.pipe(up);
 }
 
-function appUnavailable(res, mount, err) {
+function appUnavailable(res: ServerResponse, mount: Share, err?: Error) {
   if (res.headersSent || res.destroyed) { try { res.destroy(); } catch { /* ignore */ } return; }
   lib.sendRawHtml(res, 502, 'App unavailable', `<h1>Can't reach the app</h1>
 <p>The share <code>${lib.escapeHTML(mount.path)}</code> forwards to port ${mount.port} on this computer, but nothing is answering there right now.
@@ -783,7 +791,7 @@ The app may be stopped — ask the owner to start it, then refresh.</p>`);
 /* Internal control endpoint (localhost + admin token only)             */
 /* ------------------------------------------------------------------ */
 
-function handleCtl(req, res, pathname) {
+function handleCtl(req: IncomingMessage, res: ServerResponse, pathname: string) {
   const denied = () => lib.notFoundRaw(res, 'Nothing is shared at this address.');
   if (!lib.isLocalSocket(req.socket)) return denied();
   if (!lib.timingSafeToken(String(req.headers['x-admin-token'] || ''), lib.config.adminToken)) return denied();
@@ -798,7 +806,7 @@ function handleCtl(req, res, pathname) {
 /* Request dispatch                                                     */
 /* ------------------------------------------------------------------ */
 
-function handle(req, res) {
+function handle(req: IncomingMessage, res: ServerResponse) {
   const rawUrl = req.url || '/';
 
   let url;
@@ -810,14 +818,14 @@ function handle(req, res) {
 
   // access log entry — filled in when the response finishes
   tapResponse(res);
-  const ev = {
+  const ev: AccessEvent = {
     t: Date.now(), ip: ctx.ip, method: req.method || 'GET', path: lib.obscurePinnedPath(rawUrl),
     status: 0, bytes: 0, ua: String(req.headers['user-agent'] || '').slice(0, 160),
-    share: null, kind: ctx.kind, blocked: false,
+    share: undefined, kind: ctx.kind, blocked: false,
   };
   res.on('finish', () => {
     ev.status = res.statusCode;
-    ev.bytes = res.__bytes || 0;
+    ev.bytes = (res as TappedResponse).__bytes || 0;
     try { maybeRecord(ev); } catch { /* never break a response over logging */ }
   });
 
@@ -891,7 +899,7 @@ const UPGRADE_501 = [
   '<!doctype html><meta charset="utf-8"><title>WebSockets not supported</title><body style="font:16px/1.6 system-ui,sans-serif;display:grid;place-items:center;min-height:100vh"><main style="max-width:34em;text-align:center"><h1>WebSockets not supported</h1><p>This server forwards regular HTTP only. Live/websocket features won\'t work here.</p></main>',
 ].join('\r\n');
 
-function handleUpgrade(req, socket) {
+function handleUpgrade(req: IncomingMessage, socket: import("node:stream").Duplex) {
   try {
     socket.write(UPGRADE_501 + '\r\n');
     socket.end();
@@ -915,9 +923,9 @@ const wantPortOverride = (() => {
 })();
 const PORT_LOCKED = wantPortOverride != null;
 
-function listenOn(port) {
-  return new Promise((resolve, reject) => {
-    const onError = (err) => { server.removeListener('listening', onListening); reject(err); };
+function listenOn(port: number) {
+  return new Promise<void>((resolve, reject) => {
+    const onError = (err: Error) => { server.removeListener('listening', onListening); reject(err); };
     const onListening = () => { server.removeListener('error', onError); resolve(); };
     server.once('error', onError);
     server.once('listening', onListening);
@@ -925,22 +933,22 @@ function listenOn(port) {
   });
 }
 
-let boundPort = null;
+let boundPort: number = 0;
 let rebinding = false;
 
-async function bindProxy(preferred) {
+async function bindProxy(preferred: number) {
   return lib.bindWithBump((p) => listenOn(p), preferred);
 }
 
-async function rebind(preferred) {
+async function rebind(preferred: number) {
   const old = boundPort;
-  await new Promise((resolve) => {
+  await new Promise<void>((resolve) => {
     try { server.close(() => resolve()); } catch { resolve(); }
     setTimeout(() => { try { server.closeAllConnections(); } catch { /* ignore */ } resolve(); }, 1500);
   });
   try {
     boundPort = await bindProxy(preferred);
-  } catch (err) {
+  } catch (caught) { const err = caught as NodeJS.ErrnoException;
     console.error(`proxy could not bind port ${preferred} (${err.message}) — back to ${old}`);
     boundPort = await bindProxy(old);
   }

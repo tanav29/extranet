@@ -2,12 +2,12 @@
 /*
  * Extranet launcher — the single command that runs the whole app:
  *
- *     npx extranet                 (from the npm registry, once published)
- *     npx .                        (from this repo)
+ *     extranet                     (installed package)
+ *     npm start                    (source checkout)
  *
  * It makes sure the UI bundle exists (building it once if the toolchain is
  * installed), applies command-line overrides, and then starts the Fastify
- * server in server/index.js (which prints the addresses and admin token).
+ * server in dist/server/index.js (which prints the addresses and admin token).
  *
  * Flags:
  *   --port <n>     listen on this port instead of the saved one
@@ -17,13 +17,13 @@
  */
 'use strict';
 
-const path = require('node:path');
-const fs = require('node:fs');
-const { spawnSync } = require('node:child_process');
+import * as path from 'node:path';
+import * as fs from 'node:fs';
+import { spawnSync } from 'node:child_process';
 
-const ROOT = path.join(__dirname, '..');
+const ROOT = path.resolve(__dirname, '..', '..');
 const UI_DIR = path.join(ROOT, 'app');
-const SERVER = path.join(ROOT, 'server', 'index.js');
+const SERVER = path.join(ROOT, 'dist', 'server', 'index.js');
 
 const USAGE = `Extranet — share folders and app ports from this computer.
 
@@ -44,7 +44,7 @@ const pkg = (() => {
 })();
 
 const args = process.argv.slice(2);
-let port = null;
+let port: string | null = null;
 let forceBuild = false;
 
 for (let i = 0; i < args.length; i++) {
@@ -52,14 +52,18 @@ for (let i = 0; i < args.length; i++) {
   if (a === '--help' || a === '-h') { console.log(USAGE); process.exit(0); }
   if (a === '--version' || a === '-v') { console.log(pkg.version); process.exit(0); }
   if (a === '--build') { forceBuild = true; continue; }
-  if (a === '--port' || a === '-p') { port = args[++i]; continue; }
+  if (a === '--port' || a === '-p') {
+    port = args[++i] ?? null;
+    if (port === null) { console.error('--port requires a number'); process.exit(2); }
+    continue;
+  }
   if (/^--port=\d+$/.test(a)) { port = a.split('=')[1]; continue; }
   console.error(`Unknown option: ${a}` + '\nRun "npx extranet --help" for usage.');
   process.exit(2);
 }
 
 if (port != null) {
-  const p = Number.parseInt(port, 10);
+  const p = Number(port);
   if (!Number.isInteger(p) || p < 1024 || p > 65535) {
     console.error('--port must be a number between 1024 and 65535');
     process.exit(2);
@@ -72,7 +76,10 @@ function uiBuilt() {
 }
 
 function buildUI() {
-  if (!fs.existsSync(path.join(UI_DIR, 'package.json'))) return; // no UI source here
+  if (!fs.existsSync(path.join(UI_DIR, 'package.json'))) {
+    console.error('This package contains a prebuilt UI. Reinstall it to restore missing assets; --build is for source checkouts.');
+    process.exit(1);
+  }
   const hasToolchain = fs.existsSync(path.join(UI_DIR, 'node_modules'));
   if (!hasToolchain && uiBuilt() && !forceBuild) return;        // prebuilt bundle is enough
   if (!hasToolchain) {

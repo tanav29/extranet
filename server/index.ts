@@ -1,4 +1,7 @@
 #!/usr/bin/env node
+import type { Runtime, ServiceName } from './types';
+import type { ChildProcess } from 'node:child_process';
+import type { Readable } from 'node:stream';
 /*
  * Extranet supervisor — the process `npm start` runs.
  *
@@ -14,7 +17,7 @@
  * Why so the supervisor: the services are four independent processes that
  * share no in-memory state — the registry lives in data/config.json, the
  * actually-bound ports in data/runtime.json, the access log in data/logs.json
- * (see lib.js). This process only starts the four, relays their output with a
+ * (see lib.ts). This process only starts the four, relays their output with a
  * "[name]" prefix, restarts them when they crash, prints the banner once every
  * service has published its port, and tears everything down on Ctrl+C.
  *
@@ -22,20 +25,20 @@
  */
 'use strict';
 
-const { spawn, spawnSync } = require('child_process');
-const crypto = require('crypto');
-const path = require('path');
-const lib = require('./lib');
+import { spawn, spawnSync } from 'child_process';
+import * as crypto from 'crypto';
+import * as path from 'path';
+import * as lib from './lib';
 
-const SERVICES = ['web', 'api', 'files', 'proxy'];
+const SERVICES: ServiceName[] = ['web', 'api', 'files', 'proxy'];
 const RESTART_DELAY = 800;    // ms before relaunching a crashed child
 const RESTART_CAP = 10;       // then give up on that child
 
 // Persist one shared token before any child loads config. Never replace a corrupt file.
 lib.saveConfig();
-const runtime = { runId: crypto.randomUUID(), services: {} };
+const runtime: Runtime & { services: NonNullable<Runtime["services"]> } = { runId: crypto.randomUUID(), services: {} };
 lib.writeRuntime(runtime);
-const children = new Map();          // name -> { child, restarts }
+const children = new Map<ServiceName, { child: ChildProcess; restarts: number }>();          // name -> { child, restarts }
 let stopping = false;
 let bannerShown = false;
 
@@ -43,11 +46,11 @@ let bannerShown = false;
 /* Process management                                                   */
 /* ------------------------------------------------------------------ */
 
-function serverScript(name) {
+function serverScript(name: ServiceName) {
   return path.join(__dirname, `${name}.js`);
 }
 
-function killChild(child) {
+function killChild(child: ChildProcess) {
   if (!child || child.exitCode !== null || child.signalCode !== null) return;
   try {
     if (lib.IS_WIN) {
@@ -65,8 +68,8 @@ function killAll() {
 }
 
 /* one crash restarts with a delay; give up after RESTART_CAP attempts */
-function onChildExit(name) {
-  return (code, signal) => {
+function onChildExit(name: ServiceName) {
+  return (code: number | null, signal: NodeJS.Signals | null) => {
     const entry = children.get(name);
     if (!entry) return;
     console.log(`[${name}] exited (code ${code === null ? '-' : code}${signal ? `, ${signal}` : ''})`);
@@ -85,7 +88,7 @@ function onChildExit(name) {
   };
 }
 
-function lineRelay(name, stream) {
+function lineRelay(name: ServiceName, stream: Readable) {
   /* buffer partial lines, tag every complete one with [name] */
   let buf = '';
   const MAX = 16 * 1024;
@@ -103,25 +106,27 @@ function lineRelay(name, stream) {
   stream.on('end', () => { if (buf.trim()) console.log(`[${name}] ${buf.trim()}`); buf = ''; });
 }
 
-function startChild(name, restarts = 0) {
+function startChild(name: ServiceName, restarts = 0) {
   const child = spawn(
     process.execPath,
     [serverScript(name)],
     { stdio: ['ignore', 'pipe', 'pipe', 'ipc'], env: process.env, windowsHide: true },
   );
   children.set(name, { child, restarts });
-  child.on('message', (message) => {
+  child.on('message', (value) => {
+    if (!value || typeof value !== 'object') return;
+    const message = value as { type?: string; name?: string; port?: number };
     if (stopping || children.get(name)?.child !== child) return;
     if (message?.type !== 'service-ready' || message.name !== name
-        || !Number.isInteger(message.port) || message.port < 1 || message.port > 65535) return;
+        || typeof message.port !== 'number' || !Number.isInteger(message.port) || message.port < 1 || message.port > 65535) return;
     runtime[name] = message.port;
-    runtime.services[name] = { pid: child.pid, port: message.port };
+    runtime.services[name] = { pid: child.pid!, port: message.port };
     runtime.ts = Date.now();
     lib.writeRuntime(runtime);
     maybePrintBanner(runtime);
   });
-  lineRelay(name, child.stdout);
-  lineRelay(name, child.stderr);
+  lineRelay(name, child.stdout!);
+  lineRelay(name, child.stderr!);
   child.on('error', (err) => console.error(`[supervisor] could not start ${name}: ${err.message}`));
   child.on('exit', onChildExit(name));
   return child;
@@ -131,19 +136,19 @@ function startChild(name, restarts = 0) {
 /* Banner — once every service has published its actual port            */
 /* ------------------------------------------------------------------ */
 
-function allServicesPublished(rt) {
+function allServicesPublished(rt: Runtime) {
   return rt.runId === runtime.runId && SERVICES.every((s) => {
     const child = children.get(s)?.child;
     return child && child.exitCode === null && child.signalCode === null
-      && Number.isInteger(rt[s]) && rt.services[s]?.pid === child.pid;
+      && Number.isInteger(rt[s]) && rt.services?.[s]?.pid === child.pid;
   });
 }
 
-function maybePrintBanner(rt) {
+function maybePrintBanner(rt: Runtime) {
   if (bannerShown || !allServicesPublished(rt)) return;
   bannerShown = true;
   const primary = lib.lanIPs()[0] && lib.lanIPs()[0].address;
-  const lines = [];
+  const lines: string[] = [];
   lines.push('');
   lines.push('Extranet is running.');
   lines.push(`  Admin (this computer)     http://localhost:${rt.proxy}/admin`);
