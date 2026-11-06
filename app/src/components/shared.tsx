@@ -62,7 +62,7 @@ export function Gate({ onDone }: { onDone: () => void }) {
     setErr("");
     setToken(value.trim());
     try {
-      await api("/admin/api/state");
+      await api("/api/state");
       onDone();
     } catch (e: any) {
       setErr(e.message && e.message !== "token needed" ? e.message : "wrong token");
@@ -270,9 +270,9 @@ export function QRDialog({
   const targets = useMemo(() => {
     const list: { label: string; url: string }[] = [];
     for (const it of state.ips || []) {
-      list.push({ label: `${it.address}:${state.ports.http} — ${it.name}`, url: baseUrl(state, it.address) });
+      list.push({ label: `${it.address}:${state.ports.proxy} — ${it.name}`, url: baseUrl(state, it.address) });
     }
-    if (!list.length) list.push({ label: `localhost:${state.ports.http}`, url: baseUrl(state, null) });
+    if (!list.length) list.push({ label: `localhost:${state.ports.proxy}`, url: baseUrl(state, null) });
     return list;
   }, [state]);
 
@@ -280,7 +280,7 @@ export function QRDialog({
 
   const pinSuffix = pin ? `?pin=${encodeURIComponent(pin)}` : "";
   const url = conn + (sharePath || "").replace(/\/+$/, "") + "/" + pinSuffix;
-  const src = `/admin/qr?u=${encodeURIComponent(url)}&t=${encodeURIComponent(getToken())}`;
+  const src = `/api/qr?u=${encodeURIComponent(url)}&t=${encodeURIComponent(getToken())}`;
 
   return (
     <Dialog open onOpenChange={(o) => !o && onClose()}>

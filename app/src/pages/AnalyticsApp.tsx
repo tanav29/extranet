@@ -37,7 +37,7 @@ export default function AnalyticsApp() {
 
   const refresh = useCallback(async () => {
     try {
-      const d = await api<Analytics>("/admin/api/analytics?limit=300");
+      const d = await api<Analytics>("/api/analytics?limit=300");
       setData(d);
     } catch (e: any) {
       if (e.status === 401) setNeedToken(true);
@@ -49,7 +49,7 @@ export default function AnalyticsApp() {
   useEffect(() => { refresh(); }, [refresh]);
 
   useEffect(() => {
-    api("/admin/api/state").then((s: any) => setHost(s.hostname)).catch(() => {});
+    api("/api/state").then((s: any) => setHost(s.hostname)).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -66,7 +66,7 @@ export default function AnalyticsApp() {
   async function clearLogs() {
     if (!confirm("Clear all logged requests and client stats? Blocked addresses stay blocked.")) return;
     try {
-      await api("/admin/api/logs/clear", { method: "POST" });
+      await api("/api/logs/clear", { method: "POST" });
       toast.success("Logs cleared");
       refresh();
     } catch (e: any) { toast.error(e.message); }
@@ -74,7 +74,7 @@ export default function AnalyticsApp() {
 
   async function setBlocked(ip: string, block: boolean) {
     try {
-      await api("/admin/api/block", { method: "POST", body: { ip, block } });
+      await api("/api/block", { method: "POST", body: { ip, block } });
       toast.success(block ? `Blocked ${ip}` : `Unblocked ${ip}`);
       refresh();
     } catch (e: any) { toast.error(e.message); }

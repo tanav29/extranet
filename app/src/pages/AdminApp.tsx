@@ -30,7 +30,7 @@ export default function AdminApp() {
 
   const refresh = useCallback(async () => {
     try {
-      const s = await api<State>("/admin/api/state");
+      const s = await api<State>("/api/state");
       setState(s);
       setNeedToken(false);
       setLoaded(true);
@@ -45,7 +45,7 @@ export default function AdminApp() {
   useEffect(() => { (async () => {
     // seed a stored token if present, then try
     try {
-      const s = await api<State>("/admin/api/state");
+      const s = await api<State>("/api/state");
       setState(s); setLoaded(true);
     } catch (e: any) {
       if (e.status === 401) setNeedToken(true);
@@ -56,7 +56,7 @@ export default function AdminApp() {
   useEffect(() => {
     const iv = setInterval(() => {
       if (document.visibilityState !== "visible") return;
-      api("/admin/api/state").then((s) => setState(s)).catch(() => {});
+      api("/api/state").then((s) => setState(s)).catch(() => {});
     }, 5000);
     return () => clearInterval(iv);
   }, []);
@@ -99,7 +99,7 @@ export default function AdminApp() {
 /* ---------------------------------------------------------------- */
 
 function PageTop({ state }: { state: State }) {
-  const mounts: any[] = state.mounts || [];
+  const routes: any[] = state.routes || [];
   const t = state.tunnel || {};
   const live = t.status === "running" && t.url;
 
@@ -111,7 +111,7 @@ function PageTop({ state }: { state: State }) {
       </div>
       <div className="flex flex-1 flex-wrap items-center justify-end gap-1.5">
         <StatusChip icon={<FolderOpen />}>
-          {mounts.length} {mounts.length === 1 ? "share" : "shares"}
+          {routes.length} {routes.length === 1 ? "share" : "shares"}
         </StatusChip>
         <StatusChip icon={<Globe />}>
           {live ? "Internet link live" : t.status === "starting" ? "Link connecting…" : "Internet link off"}
@@ -133,6 +133,11 @@ function PageTop({ state }: { state: State }) {
 /* Shares — the main pane                                            */
 /* ---------------------------------------------------------------- */
 
+/* the address a guest opens: folder shares live under /files/<name> */
+function sharePathOf(m: any): string {
+  return (m.kind === "folder" ? "/files" : "") + m.path;
+}
+
 function slugOf(dir: string): string {
   const base = dir.trim().split(/[\\/]/).filter(Boolean).pop() || "";
   return "/" + base.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
@@ -151,7 +156,7 @@ function SharesCard({ state, refresh, onQR }: { state: State; refresh: () => Pro
   const [busy, setBusy] = useState(false);
 
   const recents: string[] = state.recentDirs || [];
-  const mounts = state.mounts || [];
+  const routes = state.routes || [];
 
   function setDir(d: string) {
     setAddDir(d);
@@ -180,7 +185,7 @@ function SharesCard({ state, refresh, onQR }: { state: State; refresh: () => Pro
       if (addKind === "folder") body.dir = addDir;
       if (addKind === "port") body.port = parseInt(addPort, 10);
       if (addPin.trim()) body.pin = addPin.replace(/[^\d]/g, "");
-      await api("/admin/api/mounts", { method: "POST", body });
+      await api("/api/routes", { method: "POST", body });
       setAddDir(""); setAddPath(""); setAddPort(""); setAddPin("");
       setNameTouched(false);
       await refresh();
@@ -199,9 +204,9 @@ function SharesCard({ state, refresh, onQR }: { state: State; refresh: () => Pro
       icon={<FolderOpen />}
       title="Shared folders"
       bodyClass="flex flex-col min-h-full"
-      action={mounts.length ? <span className="text-[11.5px] tabular-nums text-muted-foreground">{mounts.length} shared</span> : undefined}
+      action={routes.length ? <span className="text-[11.5px] tabular-nums text-muted-foreground">{routes.length} shared</span> : undefined}
     >
-      {!mounts.length && (
+      {!routes.length && (
         <div className="flex items-start gap-2.5 border-b px-4 py-4">
           <FolderOpen className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
           <div>
@@ -212,7 +217,7 @@ function SharesCard({ state, refresh, onQR }: { state: State; refresh: () => Pro
           </div>
         </div>
       )}
-      {mounts.map((m: any) => (
+      {routes.map((m: any) => (
         <ShareRow key={m.id} m={m} state={state} refresh={refresh} onQR={onQR} />
       ))}
 
@@ -250,7 +255,7 @@ function SharesCard({ state, refresh, onQR }: { state: State; refresh: () => Pro
               <Input
                 type="number"
                 className="w-36 font-mono text-xs"
-                placeholder="port (e.g. 3000)"
+                placeholder="port (e.g. 8090)"
                 min={1024}
                 max={65535}
                 value={addPort}
@@ -342,7 +347,7 @@ function ShareRow({ m, state, refresh, onQR }: { m: any; state: State; refresh: 
     if (next.lan !== undefined) setLan(next.lan);
     if (next.public !== undefined) setPub(next.public);
     try {
-      await api(`/admin/api/mounts/${m.id}`, { method: "PATCH", body: { ...m, ...next } });
+      await api(`/api/routes/${m.id}`, { method: "PATCH", body: { ...m, ...next } });
       await refresh();
     } catch (e: any) {
       toast.error(e.message);
@@ -353,7 +358,7 @@ function ShareRow({ m, state, refresh, onQR }: { m: any; state: State; refresh: 
   async function del() {
     if (!confirm(`Stop sharing ${m.path}? Guests lose access immediately.`)) return;
     try {
-      await api(`/admin/api/mounts/${m.id}`, { method: "DELETE" });
+      await api(`/api/routes/${m.id}`, { method: "DELETE" });
       await refresh();
       toast.success(`Stopped sharing ${m.path}`);
     } catch (e: any) { toast.error(e.message); }
@@ -362,7 +367,7 @@ function ShareRow({ m, state, refresh, onQR }: { m: any; state: State; refresh: 
   function shareUrl(): string {
     const t = state?.tunnel || {};
     const base = t.status === "running" && t.url && m.public ? t.url : baseUrl(state, primaryIP(state));
-    return base + m.path + "/" + (m.pin ? `?pin=${encodeURIComponent(m.pin)}` : "");
+    return base + sharePathOf(m) + "/" + (m.pin ? `?pin=${encodeURIComponent(m.pin)}` : "");
   }
 
   return (
@@ -372,7 +377,7 @@ function ShareRow({ m, state, refresh, onQR }: { m: any; state: State; refresh: 
       </span>
       <div className="min-w-40 flex-1">
         <div className="flex items-center gap-1.5">
-          <a href={shareUrl()} target="_blank" rel="noopener" className="truncate font-mono text-[12.5px] hover:underline">{m.path}/</a>
+          <a href={shareUrl()} target="_blank" rel="noopener" className="truncate font-mono text-[12.5px] hover:underline">{sharePathOf(m)}/</a>
           {m.kind === "port" ? (
             <Badge variant="secondary" className="gap-1 font-normal"><Cable className="size-3" />:{m.port}</Badge>
           ) : null}
@@ -390,7 +395,7 @@ function ShareRow({ m, state, refresh, onQR }: { m: any; state: State; refresh: 
       <ScopeSwitches lan={lan} pub={pub} onLan={(v) => patch({ lan: v })} onPub={(v) => patch({ public: v })} />
       <div className="flex items-center opacity-60 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
         <IconBtn title="Copy link (includes the PIN when set)" onClick={() => copyText(shareUrl()).then(() => toast.success("Link copied"))}><Copy /></IconBtn>
-        <IconBtn title="Show QR" onClick={() => onQR(m.path, m.pin)}><QrCode /></IconBtn>
+        <IconBtn title="Show QR" onClick={() => onQR(sharePathOf(m), m.pin)}><QrCode /></IconBtn>
         <IconBtn
           title={m.kind === "port" ? "Edit address, port and PIN" : "Edit address and PIN"}
           onClick={() => setEditOpen(true)}
@@ -435,7 +440,7 @@ function ShareEditDialog({
       const body: any = { path, pin };
       if (m.kind === "port") body.port = parseInt(port, 10);
       else body.dir = m.dir;
-      await api(`/admin/api/mounts/${m.id}`, { method: "PATCH", body });
+      await api(`/api/routes/${m.id}`, { method: "PATCH", body });
       onOpenChange(false);
       await onDone();
       const cleared = !!m.pin && !pin;
@@ -516,7 +521,7 @@ function FolderPickerDialog({
 
   const load = useCallback(async (p: string) => {
     try {
-      const d = await api<any>(`/admin/api/fs?path=${encodeURIComponent(p)}`);
+      const d = await api<any>(`/api/fs?path=${encodeURIComponent(p)}`);
       setAt(d.path);
       setDirs(d.dirs || []);
       setDrives(!!d.drives);
@@ -591,7 +596,7 @@ function TunnelCard({ state, refresh, onQR }: { state: State; refresh: () => Pro
   async function start() {
     toast("Starting the internet link…");
     try {
-      const r = await api("/admin/api/tunnel/start", { method: "POST" });
+      const r = await api("/api/tunnel/start", { method: "POST" });
       await refresh();
       if (!r.ok) toast.error(r.error || "Could not start the tunnel");
       else if (r.url) toast.success("Internet link is live");
@@ -599,13 +604,13 @@ function TunnelCard({ state, refresh, onQR }: { state: State; refresh: () => Pro
   }
 
   async function stop() {
-    try { await api("/admin/api/tunnel/stop", { method: "POST" }); await refresh(); } catch (e: any) { toast.error(e.message); }
+    try { await api("/api/tunnel/stop", { method: "POST" }); await refresh(); } catch (e: any) { toast.error(e.message); }
   }
 
   async function install() {
     toast("Downloading the Cloudflare helper… (one time)");
     try {
-      const r = await api("/admin/api/tunnel/install", { method: "POST" });
+      const r = await api("/api/tunnel/install", { method: "POST" });
       await refresh();
       if (r.ok) toast.success("Ready — start the link when you need it");
       else toast.error(r.error || "Install failed");
@@ -679,15 +684,15 @@ function TunnelCard({ state, refresh, onQR }: { state: State; refresh: () => Pro
 /* ---------------------------------------------------------------- */
 
 function NetworkCard({ state, refresh }: { state: State; refresh: () => Promise<any> }) {
-  const [httpPort, setHttpPort] = useState(String(state.ports.http));
+  const [proxyPort, setProxyPort] = useState(String(state.ports.proxy));
 
   useEffect(() => {
-    setHttpPort(String(state.ports.http));
-  }, [state.ports.http]);
+    setProxyPort(String(state.ports.proxy));
+  }, [state.ports.proxy]);
 
   async function apply() {
     try {
-      await api("/admin/api/settings", { method: "PATCH", body: { httpPort: parseInt(httpPort, 10) } });
+      await api("/api/settings", { method: "PATCH", body: { proxyPort: parseInt(proxyPort, 10) } });
       toast.success("Settings applied");
       setTimeout(() => refresh(), 2000);
     } catch (e: any) { toast.error(e.message); }
@@ -714,7 +719,7 @@ function NetworkCard({ state, refresh }: { state: State; refresh: () => Promise<
       </div>
       <div className="flex flex-wrap items-center gap-2 border-t px-4 py-2.5">
         <span className="text-[11.5px] text-muted-foreground">Port</span>
-        <Input type="number" className="w-20 font-mono text-xs" value={httpPort} onChange={(e) => setHttpPort(e.target.value)} />
+        <Input type="number" className="w-20 font-mono text-xs" value={proxyPort} onChange={(e) => setProxyPort(e.target.value)} />
         <div className="flex-1" />
         <Button size="sm" variant="outline" onClick={apply}>Apply</Button>
       </div>

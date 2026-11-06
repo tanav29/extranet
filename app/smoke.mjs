@@ -7,7 +7,7 @@ import { pathToFileURL } from "node:url";
 const base = path.dirname(fileURLToPath(import.meta.url)); // app/
 const pub = path.resolve(base, "dist", "assets");
 
-/* the running server's port: EXTRANET_PORT, data/config.json, else the default */
+/* the running proxy's port: EXTRANET_PORT, data/config.json proxyPort, else the default */
 function serverOrigin() {
   if (process.env.EXTRANET_PORT) return `http://localhost:${process.env.EXTRANET_PORT}`;
   try {
@@ -16,11 +16,11 @@ function serverOrigin() {
     for (const dir of [cfgRoot, cfgHome]) {
       try {
         const cfg = JSON.parse(fs.readFileSync(path.join(dir, "config.json"), "utf8"));
-        if (cfg.httpPort) return `http://localhost:${cfg.httpPort}`;
+        if (cfg.proxyPort) return `http://localhost:${cfg.proxyPort}`;
       } catch { /* try the next one */ }
     }
   } catch { /* default below */ }
-  return "http://localhost:5050";
+  return "http://localhost:8787";
 }
 const ORIGIN = serverOrigin();
 
@@ -68,7 +68,7 @@ const results = [];
 results.push(["home", await boot(`${ORIGIN}/`, "home", ["Hi 👋", "Shared on this computer", "read-only"])]);
 results.push(["admin", await boot(`${ORIGIN}/admin`, "admin", ["This network", "Shared folders", "Internet link", "Analytics"])]);
 results.push(["analytics", await boot(`${ORIGIN}/analytics`, "analytics", ["Analytics", "Request log", "Clients"])]);
-results.push(["browse", await boot(`${ORIGIN}/movies/`, "browse", ["Download all", "items"])]);
+results.push(["browse", await boot(`${ORIGIN}/files/movies/`, "browse", ["Download all", "items"])]);
 
 let fail = false;
 for (const [name, r] of results) {

@@ -44,7 +44,7 @@ export default function HomeApp() {
 
   const load = useCallback(async () => {
     try {
-      const r = await fetch(location.pathname + "?json=1", { headers: { Accept: "application/json" } });
+      const r = await fetch("/api/directory", { headers: { Accept: "application/json" } });
       if (!r.ok) throw new Error("The server said " + r.status + ".");
       setInfo(await r.json());
       setError("");

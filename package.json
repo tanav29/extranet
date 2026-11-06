@@ -19,7 +19,9 @@
     "dev": "npm --prefix app run dev",
     "build": "npm --prefix app run build",
     "prepublishOnly": "npm run build",
-    "smoke": "node app/smoke.mjs"
+    "smoke": "node app/smoke.mjs",
+    "test": "node --test test/*.test.js",
+    "typecheck": "npm --prefix app run typecheck"
   },
   "engines": {
     "node": ">=20.17"

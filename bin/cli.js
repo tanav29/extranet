@@ -30,13 +30,13 @@ const USAGE = `Extranet — share folders and app ports from this computer.
 Usage: npx extranet [options]
 
 Options:
-  --port <n>     listen on this port (default: the saved port, usually 5050)
+  --port <n>     listen on this port (default: the saved port, usually 8787)
   --build        rebuild the web UI from app/ before starting
   --help         show this help
   --version      show the version
 
 After it starts, open the admin console it prints, e.g.
-  http://localhost:5050/admin`;
+  http://localhost:8787/admin`;
 
 const pkg = (() => {
   try { return JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')); }

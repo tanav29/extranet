@@ -93,7 +93,7 @@ export function primaryIP(state: any): string | null {
 }
 
 export function baseUrl(state: any, ip: string | null): string {
-  const port = (state?.ports?.http) || 5050;
+  const port = (state?.ports?.proxy) || 8787;
   if (!ip) return `http://localhost:${port}`;
   return `http://${ip}:${port}`;
 }
