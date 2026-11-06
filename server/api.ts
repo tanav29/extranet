@@ -387,6 +387,16 @@ function directoryState(ctx: VisitorContext) {
   };
 }
 
+function portOptions(body: Record<string, unknown>, route: Share): string | null {
+  if (body.adapter !== undefined && !['native', 't3'].includes(String(body.adapter))) return 'invalid adapter';
+  if (body.upstreamPath !== undefined && !['strip', 'preserve'].includes(String(body.upstreamPath))) return 'invalid upstream path mode';
+  if (body.entryPath !== undefined && (typeof body.entryPath !== 'string' || (body.entryPath !== '' && !/^\/(?!\/)[a-zA-Z0-9/_-]*$/.test(body.entryPath)))) return 'entry path must be a local path such as /pair';
+  if (body.adapter !== undefined) route.adapter = body.adapter as Share['adapter'];
+  if (body.upstreamPath !== undefined) route.upstreamPath = body.upstreamPath as Share['upstreamPath'];
+  if (body.entryPath !== undefined) route.entryPath = body.entryPath as string;
+  return null;
+}
+
 function publicRoute(m: Share) {
   return {
     id: m.id,
@@ -394,6 +404,9 @@ function publicRoute(m: Share) {
     path: m.path,
     dir: m.dir,
     port: m.port,
+    adapter: m.adapter,
+    upstreamPath: m.upstreamPath,
+    entryPath: m.entryPath,
     pin: m.pin,
     lan: m.lan !== false,
     public: m.public === true,
@@ -677,6 +690,10 @@ async function apiRoute(req: FastifyRequest, reply: FastifyReply) {
         return json(reply, 400, { error: "that's the port the reverse proxy runs on — it would loop forever" });
       }
       route.port = Number(body.port);
+      route.adapter = route.port === 3773 ? 't3' : 'native';
+      route.upstreamPath = 'strip';
+      const optionsError = portOptions(body, route);
+      if (optionsError) return json(reply, 400, { error: optionsError });
     } else {
       const dir = String(body.dir || '').trim();
       const st = await fsp.stat(path.resolve(dir)).catch(() => null);
@@ -698,6 +715,9 @@ async function apiRoute(req: FastifyRequest, reply: FastifyReply) {
   if (method === 'PATCH' && route) {
     let body;
     try { body = parseBody(req); } catch { return json(reply, 400, { error: 'bad json' }); }
+    const options = { ...route };
+    const optionsError = portOptions(body, options);
+    if (optionsError) return json(reply, 400, { error: optionsError });
     if (body.path !== undefined) {
       const p = lib.normUrlPath(body.path);
       if (!p) return json(reply, 400, { error: 'bad address' });
@@ -733,6 +753,7 @@ async function apiRoute(req: FastifyRequest, reply: FastifyReply) {
       }
       route.port = Number(body.port);
     }
+    Object.assign(route, { adapter: options.adapter, upstreamPath: options.upstreamPath, entryPath: options.entryPath });
     if (body.pin !== undefined) {
       const pinErr = applyPin(route, body.pin);
       if (pinErr) return json(reply, 400, { error: pinErr });

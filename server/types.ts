@@ -16,6 +16,9 @@ export interface Share {
   path: string;
   dir?: string;
   port?: number | null;
+  upstreamPath?: 'strip' | 'preserve';
+  adapter?: 'native' | 't3';
+  entryPath?: string;
   pin?: string | null;
   lan: boolean;
   public: boolean;

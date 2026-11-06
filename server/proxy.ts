@@ -36,6 +36,7 @@ import type { Socket } from 'node:net';
 import * as http from 'http';
 import * as fs from 'fs';
 import * as lib from './lib';
+import { t3Bootstrap, rewriteT3Script } from './t3-adapter';
 
 const { HOP_SKIP_REQ, HOP_SKIP_RES, EDGE_HEADERS, rawHeaderPairs } = lib;
 
@@ -138,7 +139,7 @@ function tapResponse(res: TappedResponse) {
 
 /* the three services — fixed registry entries, always present */
 type TappedResponse = ServerResponse & { __bytes?: number; __tap?: boolean };
-type ProxyMount = Share & { setPortCookie?: boolean };
+type ProxyMount = Share;
 type DynamicRoute = { kind: 'folder' | 'port'; path: string; prefix: string; mount: Share };
 type ServiceRoute = { kind: 'service'; service: ServiceName; path: string };
 
@@ -180,67 +181,6 @@ function resolveRoute(pathname: string, kind: ClientKind) {
     if (r.path !== '/' && (r.path === pathname || pathname.startsWith(r.path + '/'))) return r;
   }
   return null;
-}
-
-/*
- * For requests without a usable same-origin Referer, keep the root fallback
- * only when the visitor can see exactly one app. Otherwise ownership cannot
- * be determined safely.
- */
-function soleVisiblePortShare(kind: ClientKind) {
-  let found: Share | null = null;
-  for (const m of lib.config.routes) {
-    if (m.kind !== 'port' || !m.port) continue;
-    if (!routeVisible(m, kind)) continue;
-    if (found) return null;         // two apps in play: nobody owns stray paths
-    found = m;
-  }
-  return found;
-}
-
-/*
- * Root-absolute requests created at runtime (for example fetch('/api/users'))
- * have no share prefix. Browsers send the page URL in Referer for same-origin
- * subrequests, which identifies which mounted app owns that root path even
- * when several apps are shared on this hostname. Explicit share routes are
- * resolved first, so their ownership is never changed by Referer.
- */
-function referringPortShare(raw: IncomingMessage, kind: ClientKind) {
-  const value = raw.headers.referer || raw.headers.referrer;
-  if (!value) return null;
-  let pathname;
-  try {
-    const ref = new URL(String(value));
-    if (ref.host.toLowerCase() !== String(raw.headers.host || '').toLowerCase()) return null;
-    pathname = ref.pathname;
-  } catch { return null; }
-  const route = resolveRoute(pathname, kind);
-  return route && route.kind === 'port' ? route.mount : null;
-}
-
-/* T3-like apps can move SPA routes to the origin root after initial load. */
-function cookiePortShare(raw: IncomingMessage, kind: ClientKind) {
-  const cookie = String(raw.headers.cookie || '');
-  const match = cookie.match(/(?:^|;\s*)extranet-port-share=([^;]+)/);
-  if (!match) return null;
-  const id = match[1];
-  return lib.config.routes.find((m) => m.kind === 'port' && m.id === id && m.port && routeVisible(m, kind)) || null;
-}
-
-function refererTargetsWebService(raw: IncomingMessage, kind: ClientKind) {
-  const value = raw.headers.referer || raw.headers.referrer;
-  if (!value) return false;
-  try {
-    const ref = new URL(String(value));
-    if (ref.host.toLowerCase() !== String(raw.headers.host || '').toLowerCase()) return false;
-    const p = ref.pathname;
-    return resolveRoute(p, kind)?.kind === 'service'
-      || p === '/'
-      || p === '/admin' || p.startsWith('/admin/')
-      || p === '/analytics' || p.startsWith('/analytics/')
-      || p === '/app' || p.startsWith('/app/')
-      || p === '/favicon.ico' || p === '/robots.txt';
-  } catch { return false; }
 }
 
 /* ------------------------------------------------------------------ */
@@ -339,9 +279,8 @@ function forwardService(service: ServiceName, req: IncomingMessage, res: ServerR
 
 /*
  * Root-absolute URLs in HTML and CSS are prefixed with the share path. Runtime
- * URLs from JavaScript use the same-origin Referer to identify their app,
- * allowing multiple apps to share one hostname. Requests without a usable
- * Referer fall back only when one visible app makes the target unambiguous.
+ * URLs must retain their prefix. Native apps configure their own base path;
+ * the T3 adapter supplies router and runtime URL compatibility.
  */
 
 const REWRITE_LIMIT = 4 * 1024 * 1024;
@@ -508,36 +447,21 @@ function rewriteManifestJson(text: string, mountPath: string) {
   });
 }
 
-/* App cookies stay root-scoped for root-relative API requests, but are
- * namespaced so two port shares can safely use the same upstream cookie name. */
-function appCookiePrefix(mount: Share) {
-  return `xproxy-${String(mount.id || '').replace(/[^a-z0-9_-]/gi, '_')}-`;
-}
-
+/* Preserve cookie names for browser readers and scope paths to their app. */
 function namespaceAppCookie(cookie: string, mount: Share) {
-  let value = String(cookie);
-  value = value.replace(/^(\s*)([^=;\s]+)=/, (_match, space, name) => `${space}${appCookiePrefix(mount)}${name}=`);
-  if (/;\s*path\s*=/i.test(value)) value = value.replace(/;\s*path\s*=\s*[^;]*/i, '; Path=/');
-  else value += '; Path=/';
+  let value = cookie.replace(/;\s*domain\s*=\s*[^;]*/ig, '');
+  if (/;\s*path\s*=/i.test(value)) {
+    value = value.replace(/;\s*path\s*=\s*([^;]*)/i, (_m, path) =>
+      '; Path=' + (shareRef(path.trim(), mount.path) || path.trim()));
+  } else value += '; Path=' + mount.path + '/';
   return value;
 }
 
-function appCookiesForUpstream(header: string | string[] | undefined, mount: Share) {
-  const prefix = appCookiePrefix(mount);
-  const kept: string[] = [];
-  for (const pair of String(header || '').split(';')) {
-    const item = pair.trim();
-    if (!item) continue;
-    const eq = item.indexOf('=');
-    if (eq < 1) continue;
-    const name = item.slice(0, eq);
-    const value = item.slice(eq + 1);
-    if (name === PORT_SHARE_COOKIE) continue;
-    if (name.startsWith(prefix)) kept.push(`${name.slice(prefix.length)}=${value}`);
-    else if (name.startsWith('xproxy-')) continue; // another app's namespaced cookie
-    else kept.push(item);
-  }
-  return kept.join('; ');
+function appCookiesForUpstream(header: string | string[] | undefined, _mount: Share) {
+  return String(header || '').split(';').map(p => p.trim()).filter(p => {
+    const name = p.slice(0, p.indexOf('='));
+    return name !== PORT_SHARE_COOKIE && !name.startsWith('xpin-') && !name.startsWith('xproxy-');
+  }).join('; ');
 }
 
 /*
@@ -566,9 +490,6 @@ function proxyResponseHeaders(uRes: IncomingMessage, mount: ProxyMount) {
       value = namespaceAppCookie(value, mount);
     }
     pairs[i + 1] = value;
-  }
-  if (mount.setPortCookie) {
-    pairs.push('set-cookie', `${PORT_SHARE_COOKIE}=${encodeURIComponent(mount.id)}; Path=/; HttpOnly; SameSite=Lax`);
   }
   return pairs;
 }
@@ -619,7 +540,7 @@ function sendUpstreamBody(uRes: IncomingMessage, res: ServerResponse, mount: Pro
   const isRedirect = (uRes.statusCode || 0) >= 300 && (uRes.statusCode || 0) < 400;
   const potentiallyRewriteable = !noResponseBody
     && !uRes.headers['content-encoding']
-    && REWRITEABLE_TYPE.test(ctype)
+    && (REWRITEABLE_TYPE.test(ctype) || (mount.adapter === 't3' && /(?:javascript|ecmascript)/i.test(ctype)))
     && !isRedirect;
 
   if (potentiallyRewriteable && hasCL && size > REWRITE_LIMIT) return pipeUpstream(uRes, res, mount);
@@ -639,7 +560,7 @@ function sendUpstreamBody(uRes: IncomingMessage, res: ServerResponse, mount: Pro
         uRes.pause();
         let total = 0;
         try {
-          for await (const chunk of uRes) {
+          for await (const chunk of uRes.iterator({ destroyOnReturn: false })) {
             if (total + chunk.length > REWRITE_LIMIT) {
               overflow = true;
               chunks.push(chunk);
@@ -669,16 +590,20 @@ function sendUpstreamBody(uRes: IncomingMessage, res: ServerResponse, mount: Pro
 
       const isCss = /^\s*text\/css\b/i.test(ctype);
       const isManifest = /manifest\+json/i.test(ctype);
-      const text = isCss ? rewriteCssText(body.toString('utf8'), mount.path)
+      const isScript = /(?:javascript|ecmascript)/i.test(ctype);
+      let text = isScript ? rewriteT3Script(body.toString('utf8'), mount.path) : isCss ? rewriteCssText(body.toString('utf8'), mount.path)
         : isManifest ? rewriteManifestJson(body.toString('utf8'), mount.path)
         : rewriteHtmlDoc(body.toString('utf8'), mount.path);
+      if (mount.adapter === 't3' && /(?:text\/html|xhtml)/i.test(ctype)) {
+        text = text.replace(/<head\b[^>]*>/i, tag => tag + `<script src="${mount.path}/__extranet_bootstrap.js"></script>`);
+      }
       const out = Buffer.from(text, 'utf8');
 
       const pairs = proxyResponseHeaders(uRes, mount);
       const final: string[] = [];
       for (let i = 0; i < pairs.length; i += 2) {
         const name = pairs[i];
-        if (name === 'content-length' || name === 'etag') continue;
+        if (name === 'content-length' || name === 'etag' || name === 'last-modified' || name === 'content-md5' || name === 'accept-ranges') continue;
         final.push(name, pairs[i + 1]);
       }
       final.push('content-length', String(out.length));
@@ -709,21 +634,25 @@ function proxyTargetPath(url: URL, upstreamBase: string) {
 
 function servePortRoute(req: IncomingMessage, res: ServerResponse, route: DynamicRoute, url: URL, ctx: VisitorContext, upstreamBase: string) {
   const mount = route.mount;
-  const proxyMount = upstreamBase ? { ...mount, setPortCookie: true } : mount;
+  const proxyMount = mount;
   const method = (req.method || 'GET').toUpperCase();
 
   // 6-digit PIN check first (the gate page and the redirect that consumes an
   // entered PIN both answer here; the owner's own computer never needs it)
   if (!lib.enforceSharePinRaw(req, res, mount, url, ctx.ip, ctx.local)) return;
+  if (mount.adapter === 't3' && url.pathname === mount.path + '/__extranet_bootstrap.js') {
+    res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store' });
+    return res.end(t3Bootstrap(mount.path));
+  }
 
   const parsed = lib.parseSegments(url.pathname);
   const urlPath = parsed ? '/' + parsed.segs.join('/') : url.pathname;
   const trailing = parsed ? parsed.trailing : false;
 
-  // T3 Code has no route at its root; its browser pairing entry is /pair.
-  if ((method === 'GET' || method === 'HEAD') && mount.port === 3773 && urlPath === mount.path) {
+  const entryPath = mount.entryPath || (mount.adapter === 't3' ? '/pair' : '/');
+  if ((method === 'GET' || method === 'HEAD') && entryPath !== '/' && urlPath === mount.path) {
     res.writeHead(302, {
-      Location: mount.path + '/pair' + (url.search || ''),
+      Location: mount.path + entryPath + (url.search || ''),
       'Cache-Control': 'no-store',
     });
     return res.end();
@@ -749,11 +678,15 @@ function servePortRoute(req: IncomingMessage, res: ServerResponse, route: Dynami
   // or CSS so root-absolute paths can be rewritten before they reach clients.
   const wantsRewriteable = /\btext\/html\b|\btext\/css\b|manifest\+json/i.test(String(req.headers.accept || ''))
     || /\.css(?:[?#]|$)/i.test(url.pathname);
-  if (wantsRewriteable) delete headers['accept-encoding'];
+  if (wantsRewriteable || mount.adapter === 't3') {
+    headers['accept-encoding'] = 'identity';
+    delete headers['if-none-match'];
+    delete headers['if-modified-since'];
+  }
   headers.host = `127.0.0.1:${mount.port}`;
   headers['x-forwarded-host'] = String(req.headers.host || '');
-  headers['x-forwarded-prefix'] = upstreamBase;   // public path the app lives under
-  headers['x-forwarded-proto'] = 'http';
+  headers['x-forwarded-prefix'] = mount.path;   // public path the app lives under
+  headers['x-forwarded-proto'] = externalProtocol(req, ctx);
   headers['x-forwarded-for'] = ctx.ip || '?';
 
   // request body streams straight through — no buffering, no size cap
@@ -763,7 +696,7 @@ function servePortRoute(req: IncomingMessage, res: ServerResponse, route: Dynami
     up = http.request({
       host: '127.0.0.1',
       port: mount.port,
-      path: proxyTargetPath(url, upstreamBase),
+      path: proxyTargetPath(url, mount.upstreamPath === 'preserve' ? '' : upstreamBase),
       method: req.method,
       headers,
       agent: false, // one fresh upstream connection per visitor request
@@ -851,60 +784,61 @@ function handle(req: IncomingMessage, res: ServerResponse) {
     return servePortRoute(req, res, route, url, ctx, route.path);
   }
 
-  // 2) App-generated root-absolute requests use their referring share when
-  //    available, including paths such as /api that also have service routes.
-  //    Explicit share routes above still take priority.
-  const referringApp = referringPortShare(req, ctx.kind);
-  if (referringApp) {
-    ev.share = referringApp.path;
-    return servePortRoute(req, res, { kind: 'port', path: referringApp.path, prefix: referringApp.path, mount: referringApp }, url, ctx, '');
-  }
-
-  // Root-relative SPA routes no longer carry the share prefix in Referer.
-  // Keep their API and page requests with the app selected by its session
-  // cookie, except when the referring page belongs to Extranet itself.
-  const hasReferer = Boolean(req.headers.referer || req.headers.referrer);
-  const serviceWithoutReferer = !hasReferer && (route?.kind === 'service' || pathname === '/');
-  const cookieApp = !serviceWithoutReferer && !refererTargetsWebService(req, ctx.kind)
-    ? cookiePortShare(req, ctx.kind)
-    : null;
-  if (cookieApp) {
-    ev.share = cookieApp.path;
-    return servePortRoute(req, res, { kind: 'port', path: cookieApp.path, prefix: cookieApp.path, mount: cookieApp }, url, ctx, '');
-  }
-
-  // 3) Extranet's own fixed services own their prefixes without an app referrer.
+  // Unprefixed URLs belong to Extranet. Never guess an app from a cookie or Referer.
   if (route) return forwardService(route.service, req, res, ctx);
-
-  // 4) Preserve the convenient no-Referer fallback when only one app is
-  //    visible. With multiple apps there is no safe way to guess ownership.
-  const soleApp = soleVisiblePortShare(ctx.kind);
-  if (soleApp) {
-    ev.share = soleApp.path;
-    return servePortRoute(req, res, { kind: 'port', path: soleApp.path, prefix: soleApp.path, mount: soleApp }, url, ctx, '');
-  }
-
-  // 5) the web service catches everything else (and answers its own 404)
   return forwardService('web', req, res, ctx);
 }
 
-/* websocket upgrades: nothing behind the proxy speaks them — say so cleanly
- * instead of letting the socket dangle */
-const UPGRADE_501 = [
-  'HTTP/1.1 501 Not Implemented',
-  'Content-Type: text/html; charset=utf-8',
-  'Cache-Control: no-store',
-  'Connection: close',
-  '',
-  '<!doctype html><meta charset="utf-8"><title>WebSockets not supported</title><body style="font:16px/1.6 system-ui,sans-serif;display:grid;place-items:center;min-height:100vh"><main style="max-width:34em;text-align:center"><h1>WebSockets not supported</h1><p>This server forwards regular HTTP only. Live/websocket features won\'t work here.</p></main>',
-].join('\r\n');
+function externalProtocol(req: IncomingMessage, ctx: VisitorContext) {
+  // Only the local tunnel is trusted to supply forwarding metadata.
+  return ctx.isTunnel && String(req.headers['x-forwarded-proto']).split(',')[0].trim() === 'https' ? 'https' : 'http';
+}
 
-function handleUpgrade(req: IncomingMessage, socket: import("node:stream").Duplex) {
-  try {
-    socket.write(UPGRADE_501 + '\r\n');
-    socket.end();
-  } catch { /* client gone */ }
-  try { socket.destroy(); } catch { /* ignore */ }
+function handleUpgrade(req: IncomingMessage, socket: import('node:stream').Duplex, head: Buffer) {
+  const deny = (code: number) => socket.end(`HTTP/1.1 ${code} Rejected\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
+  let url: URL;
+  try { url = new URL(req.url || '/', 'http://internal'); } catch { deny(400); return; }
+  const ctx = requestCtx(req);
+  if ((req.url || '').startsWith('//')) { deny(400); return; }
+  if (!ctx.local && isBlocked(ctx.ip)) { deny(403); return; }
+  const route = resolveRoute(url.pathname, ctx.kind);
+  if (!route || route.kind !== 'port') { deny(404); return; }
+  const mount = route.mount;
+  // Upgrade handshakes cannot display a PIN form. Authenticate through the page first.
+  if (mount.pin && !ctx.local && !lib.timingSafeToken(lib.pinCookieFromRequest(req, mount) || '', lib.pinCookieValue(mount))) {
+    deny(401); return;
+  }
+  const headers: OutgoingHttpHeaders = {};
+  for (const [k, v] of Object.entries(req.headers)) if (!HOP_SKIP_REQ.has(k)) headers[k] = v;
+  headers.host = `127.0.0.1:${mount.port}`;
+  headers.connection = 'Upgrade';
+  headers.upgrade = req.headers.upgrade;
+  headers.cookie = appCookiesForUpstream(req.headers.cookie, mount);
+  headers['x-forwarded-host'] = req.headers.host;
+  headers['x-forwarded-prefix'] = mount.path;
+  headers['x-forwarded-proto'] = externalProtocol(req, ctx);
+  headers['x-forwarded-for'] = ctx.ip;
+  const up = http.request({ host: '127.0.0.1', port: mount.port,
+    path: proxyTargetPath(url, mount.upstreamPath === 'preserve' ? '' : mount.path), headers });
+  socket.on('error', () => up.destroy());
+  socket.on('close', () => up.destroy());
+  up.on('error', () => { if (!socket.destroyed) deny(502); });
+  up.on('response', res => { res.resume(); deny(res.statusCode || 502); });
+  up.on('upgrade', (res, upstream, upstreamHead) => {
+    if (socket.destroyed) { upstream.destroy(); return; }
+    const pairs = proxyResponseHeaders(res, mount);
+    socket.write(`HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n`);
+    for (let i = 0; i < pairs.length; i += 2) socket.write(`${pairs[i]}: ${pairs[i + 1]}\r\n`);
+    socket.write('\r\n');
+    if (upstreamHead.length) socket.write(upstreamHead);
+    if (head.length) upstream.write(head);
+    upstream.on('error', () => socket.destroy());
+    socket.on('error', () => upstream.destroy());
+    socket.on('close', () => upstream.destroy());
+    upstream.on('close', () => socket.destroy());
+    socket.pipe(upstream).pipe(socket);
+  });
+  up.end();
 }
 
 /* ------------------------------------------------------------------ */

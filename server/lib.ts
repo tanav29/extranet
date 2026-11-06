@@ -84,6 +84,8 @@ function normalizeRoute(m: Share) {
   if (m.kind === 'port') {
     const p = Number(m.port);
     m.port = (Number.isInteger(p) && p >= 1 && p <= 65535) ? p : null;
+    m.adapter = m.adapter === 't3' || (m.adapter === undefined && p === 3773) ? 't3' : 'native';
+    m.upstreamPath = m.upstreamPath === 'preserve' ? 'preserve' : 'strip';
   } else {
     delete m.port;
   }

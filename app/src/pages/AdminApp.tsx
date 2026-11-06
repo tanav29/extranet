@@ -424,6 +424,9 @@ function ShareEditDialog({
 }: { open: boolean; onOpenChange: (o: boolean) => void; m: any; onDone: () => Promise<any> }) {
   const [path, setPath] = useState(m.path);
   const [port, setPort] = useState(String(m.port || ""));
+  const [adapter, setAdapter] = useState(m.adapter || "native");
+  const [upstreamPath, setUpstreamPath] = useState(m.upstreamPath || "strip");
+  const [entryPath, setEntryPath] = useState(m.entryPath || "");
   const [pin, setPin] = useState(m.pin || "");
   const [busy, setBusy] = useState(false);
 
@@ -431,6 +434,9 @@ function ShareEditDialog({
     if (!open) return;
     setPath(m.path);
     setPort(String(m.port || ""));
+    setAdapter(m.adapter || "native");
+    setUpstreamPath(m.upstreamPath || "strip");
+    setEntryPath(m.entryPath || "");
     setPin(m.pin || "");
   }, [open, m]);
 
@@ -438,7 +444,7 @@ function ShareEditDialog({
     setBusy(true);
     try {
       const body: any = { path, pin };
-      if (m.kind === "port") body.port = parseInt(port, 10);
+      if (m.kind === "port") Object.assign(body, { port: parseInt(port, 10), adapter, upstreamPath, entryPath });
       else body.dir = m.dir;
       await api(`/api/routes/${m.id}`, { method: "PATCH", body });
       onOpenChange(false);
@@ -477,6 +483,26 @@ function ShareEditDialog({
               />
             </label>
           )}
+          {m.kind === "port" && <>
+            <label className="grid gap-1 text-[11.5px] font-medium text-muted-foreground">
+              App compatibility
+              <select className="rounded border bg-background p-2 text-xs" value={adapter} onChange={e => setAdapter(e.target.value)}>
+                <option value="native">App configured for this prefix</option>
+                <option value="t3">T3 Code</option>
+              </select>
+            </label>
+            <label className="grid gap-1 text-[11.5px] font-medium text-muted-foreground">
+              Upstream request path
+              <select className="rounded border bg-background p-2 text-xs" value={upstreamPath} onChange={e => setUpstreamPath(e.target.value)}>
+                <option value="strip">Remove share prefix</option>
+                <option value="preserve">Keep share prefix</option>
+              </select>
+            </label>
+            <label className="grid gap-1 text-[11.5px] font-medium text-muted-foreground">
+              Start page (optional)
+              <Input className="font-mono text-xs" value={entryPath} placeholder={adapter === "t3" ? "/pair" : "/"} onChange={e => setEntryPath(e.target.value)} />
+            </label>
+          </>}
           <label className="grid gap-1 text-[11.5px] font-medium text-muted-foreground">
             6-digit PIN
             <div className="flex items-center gap-2">

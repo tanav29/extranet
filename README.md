@@ -85,11 +85,28 @@ http://<your-computer-ip>:8787/demo/
 Extranet's internal web service prefers port 3000. If your app uses that port,
 start it first or give it a different port.
 
-Regular HTTP is supported, with rewriting for supported HTML/CSS links,
-redirects, and cookies. Compatibility depends on the app. **WebSockets are not
-supported**, so some live features and development servers will not work.
-An app-side base-path setting is preferable when available. Compressed,
-streaming, and oversized responses pass through without content rewriting.
+HTTP, WebSockets, and event streams are forwarded through each share's prefix.
+HTML/CSS links, redirects, and cookie paths are repaired. Apps must generate
+API, navigation, and socket URLs under their share prefix: configure the app's
+public base path and router basename when available. Root requests never use
+Referer or a last-opened-app cookie to guess a destination.
+
+In **Edit share**, choose whether to remove the prefix before forwarding (the
+upstream serves at `/`) or keep it (the upstream serves at the same prefix).
+Set an optional start page, such as `/pair`.
+
+For T3 Code, share port **3773** at **`/t3`**. The T3 compatibility adapter is
+selected automatically for that port; select it manually for T3 on another port.
+It supplies the TanStack router base path, repairs Vite preload URLs, and routes
+browser API/socket requests under `/t3/`. The default start page is `/pair`.
+The adapter targets T3's current Vite/TanStack build and may need an update if
+T3 changes its bundle format. It does not modify the T3 installation.
+
+Generic apps without base-path support may require their own adapter or a
+separate hostname. Compressed and oversized responses pass through without
+content rewriting; the proxy requests uncompressed content for adapted files.
+Streaming responses are forwarded without rewriting. Prefixes share a browser
+origin, including browser storage; use them for trusted apps, not origin isolation.
 
 An app share can expose the app's own write actions and permissions. The
 read-only restriction applies to Extranet folder shares.
@@ -202,7 +219,7 @@ is running, and copy its current URL. Tunnel errors appear under Internet link.
 Check that `cloudflared` is installed and can access the internet.
 
 **An app partially loads:** check its actual port, base-path support, and whether
-it requires WebSockets. See the app-sharing limitations above.
+its API/socket URLs retain the prefix. See the app-sharing settings above.
 
 **The UI is missing:** run `npm run build` in a source checkout, then restart.
 For standalone installs, reinstall a correctly built package. The `--build`
